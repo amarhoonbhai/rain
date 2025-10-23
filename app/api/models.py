@@ -25,7 +25,10 @@ class Session(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
-    user = relationship("User", back_populates="sessions")
+       user = relationship("User", back_populates="sessions")
+     api_id = Column(Integer, nullable=True)
+    api_hash_enc = Column(String, nullable=True)
+
 
 class Group(Base):
     __tablename__ = "groups"
