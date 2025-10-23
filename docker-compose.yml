@@ -15,6 +15,9 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    dns:               # ensure DNS resolution inside the container
+      - 8.8.8.8
+      - 8.8.4.4
 
   adsbot:
     build: .
@@ -28,6 +31,9 @@ services:
       - api
       - redis
     restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
 
   loginbot:
     build: .
@@ -41,6 +47,9 @@ services:
       - api
       - redis
     restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
 
   db:
     image: postgres:16-alpine
@@ -74,3 +83,4 @@ services:
 
 volumes:
   pgdata: {}
+  
