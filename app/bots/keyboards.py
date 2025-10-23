@@ -15,6 +15,9 @@ def main_menu_kb(connected: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=account_text, callback_data="add_account")],
         [InlineKeyboardButton(text="\u25A3 Add Group", callback_data="add_group")],
         [InlineKeyboardButton(text="\u25A3 Delete Group", callback_data="del_gc")],
+                [InlineKeyboardButton(text="\u25A3 Profile", callback_data="profile")],
+        [InlineKeyboardButton(text="\u25A3 Contact Developer", callback_data="contact_dev")],
+        
     ])
 
 
