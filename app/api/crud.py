@@ -34,3 +34,27 @@ def add_group(db: Session, user_id: int, chat_id: int, title: str, can_post: boo
 
 def list_groups(db: Session, user_id: int):
     return db.execute(select(models.Group).where(models.Group.user_id == user_id)).scalars().all()
+
+
+    def delete_group(db: Session, user_id: int, chat_id: int) -> bool:
+        g = db.execute(
+            select(models.Group).where(
+                models.Group.user_id == user_id,
+                models.Group.chat_id == chat_id,
+            )
+        ).scalar_one_or_none()
+        if not g:
+            return False
+        db.delete(g)
+        db.flush()
+        return True
+
+    def has_active_session(db: Session, user_id: int) -> bool:
+        return bool(
+            db.execute(
+                select(models.Session).where(
+                    models.Session.user_id == user_id,
+                    models.Session.is_active == True,
+                )
+            ).first()
+        )
