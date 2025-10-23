@@ -1,6 +1,7 @@
 import os
 from pydantic import BaseModel
 
+
 class Settings(BaseModel):
     # Bot tokens (used by bots; API reads for completeness)
     adsbot_token: str | None = os.getenv("ADSBOT_TOKEN")
@@ -19,5 +20,11 @@ class Settings(BaseModel):
     # DB / Redis
     database_url: str = os.getenv("DATABASE_URL", "postgresql+psycopg://spinify:spinify@db:5432/spinify")
     redis_url: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+    # Optional extras
+    join_group_url: str | None = os.getenv("JOIN_GROUP_URL")
+    login_bot_username: str | None = os.getenv("LOGIN_BOT_USERNAME")
+    adsbot_username: str | None = os.getenv("ADSBOT_USERNAME")
+
 
 settings = Settings()
