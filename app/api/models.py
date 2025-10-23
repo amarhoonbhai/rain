@@ -1,7 +1,17 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Boolean, ForeignKey, UniqueConstraint
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    BigInteger,
+    DateTime,
+    Boolean,
+    ForeignKey,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 from .db import Base
+
 
 class User(Base):
     __tablename__ = "users"
@@ -14,8 +24,13 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     bio_consent_at = Column(DateTime, nullable=True)
 
-    sessions = relationship("Session", back_populates="user", cascade="all, delete-orphan")
-    groups = relationship("Group", back_populates="user", cascade="all, delete-orphan")
+    sessions = relationship(
+        "Session", back_populates="user", cascade="all, delete-orphan"
+    )
+    groups = relationship(
+        "Group", back_populates="user", cascade="all, delete-orphan"
+    )
+
 
 class Session(Base):
     __tablename__ = "sessions"
@@ -25,9 +40,14 @@ class Session(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
-       user = relationship("User", back_populates="sessions")
-     api_id = Column(Integer, nullable=True)
+    # Store the API credentials used to create this Telethon session.
+    # These values are persisted so that later requests (for example verifying group
+    # membership) can recreate a Telethon client without prompting the user again.
+    # The API hash is encrypted using the same Fernet key as the session itself.
+    api_id = Column(Integer, nullable=True)
     api_hash_enc = Column(String, nullable=True)
+
+    user = relationship("User", back_populates="sessions")
 
 
 class Group(Base):
