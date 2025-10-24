@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+env/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Archives
+*.zip
+
+# Logs
+*.log
