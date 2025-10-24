@@ -1,0 +1,14 @@
+[Unit]
+Description=Spinify Login Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/data/spinify_public_v1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 spinify_login_bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
