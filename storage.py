@@ -1,219 +1,221 @@
-import aiosqlite
 import os
+import time
+import json
+import binascii
+import base64
+import aiosqlite
 from typing import Optional, List, Tuple, Any, Dict
 from cryptography.fernet import Fernet
-import base64, binascii, json, time
 
 DEFAULT_DB_PATH = os.getenv("DB_PATH", "data/spinify.sqlite")
 
-def _fernet_from_hex(hexkey: str) -> Fernet:
+def _build_fernet(key_str: str) -> Fernet:
     """
-    Accepts a 32-byte hex key (64 chars), derives a Fernet key.
+    Accepts either:
+      - urlsafe base64 32-byte Fernet key (44 chars, usually ends with '='), OR
+      - 64-char hex string (32 raw bytes) which we will convert to Fernet key.
     """
-    if not hexkey:
-        raise RuntimeError("ENCRYPTION_KEY missing")
+    if not key_str:
+        raise RuntimeError("ENCRYPTION_KEY missing in environment")
+    key_str = key_str.strip()
+
+    # Hex format?
+    if all(c in "0123456789abcdefABCDEF" for c in key_str) and len(key_str) == 64:
+        raw = binascii.unhexlify(key_str)
+        fkey = base64.urlsafe_b64encode(raw)
+        return Fernet(fkey)
+
+    # Otherwise treat as base64
     try:
-        raw = binascii.unhexlify(hexkey.strip())
-    except Exception:
-        raise RuntimeError("ENCRYPTION_KEY must be 64 hex chars (32 bytes)")
-    if len(raw) != 32:
-        raise RuntimeError("ENCRYPTION_KEY must be 32 bytes (64 hex chars)")
-    # Derive urlsafe base64 key for Fernet
-    fkey = base64.urlsafe_b64encode(raw)
-    return Fernet(fkey)
+        # Validate by constructing a Fernet
+        return Fernet(key_str.encode())
+    except Exception as e:
+        raise RuntimeError("Invalid ENCRYPTION_KEY; must be 64-hex or Fernet base64") from e
+
 
 class Storage:
-    def __init__(self, db_path: str = DEFAULT_DB_PATH, enc_hex: str = ""):
-        self.db_path = db_path
-        self.enc = _fernet_from_hex(enc_hex)
+    def __init__(self, db_path: str = None, encryption_key: str = None):
+        self.db_path = db_path or DEFAULT_DB_PATH
+        self._fernet = _build_fernet(encryption_key or os.getenv("ENCRYPTION_KEY", ""))
 
+    # ---------------- Schema ----------------
     async def init(self):
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
-            await db.executescript("""
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS users(
-                tg_id INTEGER PRIMARY KEY,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions(
-                tg_id INTEGER PRIMARY KEY,
-                api_id INTEGER NOT NULL,
-                api_hash TEXT NOT NULL,
-                session_enc BLOB NOT NULL,
-                valid INTEGER NOT NULL DEFAULT 1,
-                last_check_at INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS settings(
-                tg_id INTEGER PRIMARY KEY,
-                posting_on INTEGER NOT NULL DEFAULT 0,
-                last_global_send INTEGER,
-                interval_s INTEGER NOT NULL DEFAULT 1800, -- 30min
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS blueprint(
-                tg_id INTEGER PRIMARY KEY,
-                src_chat_id INTEGER NOT NULL,
-                src_msg_id INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS targets(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                title TEXT,
-                type TEXT, -- 'group'|'channel'
-                enabled INTEGER NOT NULL DEFAULT 1,
-                last_send_at INTEGER,
-                fail_count INTEGER NOT NULL DEFAULT 0,
-                cooldown_until INTEGER,
-                last_verified_at INTEGER,
-                UNIQUE(tg_id, chat_id)
-            );
-            CREATE TABLE IF NOT EXISTS audit(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                payload TEXT,
-                ts INTEGER NOT NULL
-            );
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users(
+                    tg_id INTEGER PRIMARY KEY,
+                    api_id TEXT,
+                    api_hash TEXT,
+                    string_session TEXT,
+                    phone TEXT,
+                    is_active INTEGER DEFAULT 0,
+                    created_at INTEGER
+                )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS messages(
+                    tg_id INTEGER PRIMARY KEY,
+                    text TEXT,
+                    updated_at INTEGER
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS targets(
+                    tg_id INTEGER,
+                    chat_id INTEGER,
+                    title TEXT,
+                    username TEXT,
+                    added_at INTEGER,
+                    last_send_at INTEGER,
+                    cooldown_until INTEGER,
+                    fail_count INTEGER DEFAULT 0,
+                    PRIMARY KEY (tg_id, chat_id)
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS audit(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_id INTEGER,
+                    action TEXT,
+                    payload TEXT,
+                    ts INTEGER
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_targets_tg ON targets(tg_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_audit_tg ON audit(tg_id)")
             await db.commit()
 
-    # --- Users & settings ---
-    async def ensure_user(self, tg_id: int):
+    # -------------- Helpers --------------
+    def _enc(self, s: str) -> str:
+        if s is None:
+            return None
+        token = self._fernet.encrypt(s.encode())
+        return token.decode()
+
+    def _dec(self, s: Optional[str]) -> Optional[str]:
+        if not s:
+            return None
+        return self._fernet.decrypt(s.encode()).decode()
+
+    # -------------- Users / Sessions --------------
+    async def set_user_session(self, tg_id: int, api_id: str, api_hash: str, string_session: str, phone: str = ""):
         now = int(time.time())
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("INSERT OR IGNORE INTO users(tg_id, created_at) VALUES (?,?)", (tg_id, now))
-            await db.execute("INSERT OR IGNORE INTO settings(tg_id, created_at) VALUES (?,?)", (tg_id, now))
+            await db.execute("""
+                INSERT INTO users(tg_id, api_id, api_hash, string_session, phone, created_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(tg_id) DO UPDATE SET
+                    api_id=excluded.api_id,
+                    api_hash=excluded.api_hash,
+                    string_session=excluded.string_session,
+                    phone=excluded.phone
+            """, (tg_id, self._enc(str(api_id)), self._enc(api_hash), self._enc(string_session), self._enc(phone), now))
             await db.commit()
 
-    async def set_posting(self, tg_id: int, on: bool):
+    async def get_user_session(self, tg_id: int) -> Optional[Dict[str, str]]:
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE settings SET posting_on=? WHERE tg_id=?", (1 if on else 0, tg_id))
-            await db.commit()
-
-    async def get_settings(self, tg_id: int):
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT posting_on, last_global_send, interval_s FROM settings WHERE tg_id=?", (tg_id,))
+            cur = await db.execute("SELECT api_id, api_hash, string_session, phone FROM users WHERE tg_id=?", (tg_id,))
             row = await cur.fetchone()
-            return row
+            if not row:
+                return None
+            api_id, api_hash, string_session, phone = row
+            return {
+                "api_id": self._dec(api_id),
+                "api_hash": self._dec(api_hash),
+                "string_session": self._dec(string_session),
+                "phone": self._dec(phone) or ""
+            }
 
-    async def touch_global_send(self, tg_id: int):
+    async def set_active(self, tg_id: int, active: bool):
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE settings SET last_global_send=? WHERE tg_id=?", (int(time.time()), tg_id))
+            await db.execute("UPDATE users SET is_active=? WHERE tg_id=?", (1 if active else 0, tg_id))
             await db.commit()
 
-    # --- Sessions ---
-    async def save_session(self, tg_id: int, api_id: int, api_hash: str, session_str: str):
-        token = self.enc.encrypt(session_str.encode("utf-8"))
+    async def list_active_users(self) -> List[int]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT tg_id FROM users WHERE is_active=1")
+            return [r[0] for r in await cur.fetchall()]
+
+    # -------------- Message text --------------
+    async def set_message(self, tg_id: int, text: str):
+        now = int(time.time())
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-            INSERT INTO sessions(tg_id, api_id, api_hash, session_enc, valid, last_check_at)
-            VALUES (?,?,?,?,1,?)
-            ON CONFLICT(tg_id) DO UPDATE SET api_id=excluded.api_id, api_hash=excluded.api_hash,
-                session_enc=excluded.session_enc, valid=1, last_check_at=excluded.last_check_at
-            """, (tg_id, api_id, api_hash, token, int(time.time())))
+                INSERT INTO messages(tg_id, text, updated_at)
+                VALUES (?,?,?)
+                ON CONFLICT(tg_id) DO UPDATE SET text=excluded.text, updated_at=excluded.updated_at
+            """, (tg_id, text, now))
             await db.commit()
 
-    async def get_session(self, tg_id: int) -> Optional[Tuple[int, str, str]]:
+    async def get_message(self, tg_id: int) -> Optional[str]:
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT api_id, api_hash, session_enc FROM sessions WHERE tg_id=? AND valid=1", (tg_id,))
+            cur = await db.execute("SELECT text FROM messages WHERE tg_id=?", (tg_id,))
             row = await cur.fetchone()
-            if not row: return None
-            api_id, api_hash, enc = row
-            session_str = self.enc.decrypt(enc).decode("utf-8")
-            return api_id, api_hash, session_str
+            return row[0] if row else None
 
-    async def invalidate_session(self, tg_id: int):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE sessions SET valid=0 WHERE tg_id=?", (tg_id,))
-            await db.commit()
-
-    # --- Blueprint ---
-    async def save_blueprint(self, tg_id: int, src_chat_id: int, src_msg_id: int):
+    # -------------- Targets --------------
+    async def add_target(self, tg_id: int, chat_id: int, title: str, username: str = None):
         now = int(time.time())
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-            INSERT INTO blueprint(tg_id, src_chat_id, src_msg_id, updated_at)
-            VALUES (?,?,?,?)
-            ON CONFLICT(tg_id) DO UPDATE SET src_chat_id=excluded.src_chat_id,
-                src_msg_id=excluded.src_msg_id, updated_at=excluded.updated_at
-            """, (tg_id, src_chat_id, src_msg_id, now))
+                INSERT INTO targets(tg_id, chat_id, title, username, added_at)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(tg_id, chat_id) DO UPDATE SET title=excluded.title, username=excluded.username
+            """, (tg_id, int(chat_id), title or "", (username or "")[:64], now))
             await db.commit()
 
-    async def get_blueprint(self, tg_id: int) -> Optional[Tuple[int, int]]:
+    async def list_targets(self, tg_id: int) -> List[Tuple[int, str, str, int, int, int]]:
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT src_chat_id, src_msg_id FROM blueprint WHERE tg_id=?", (tg_id,))
-            return await cur.fetchone()
-
-    async def delete_blueprint(self, tg_id: int):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM blueprint WHERE tg_id=?", (tg_id,))
-            await db.commit()
-
-    # --- Targets ---
-    async def add_target(self, tg_id: int, chat_id: int, title: str, type_: str):
-        now = int(time.time())
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-            INSERT OR IGNORE INTO targets(tg_id, chat_id, title, type, last_verified_at)
-            VALUES (?,?,?,?,?)
-            """, (tg_id, chat_id, title, type_, now))
-            await db.commit()
-
-    async def list_targets(self, tg_id: int) -> List[Tuple[int, str, str, int]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT chat_id, title, type, enabled FROM targets WHERE tg_id=? ORDER BY title", (tg_id,))
+            cur = await db.execute("""
+                SELECT chat_id, title, username, added_at, last_send_at, COALESCE(cooldown_until,0)
+                FROM targets WHERE tg_id=? ORDER BY (last_send_at IS NOT NULL), last_send_at
+            """, (tg_id,))
             return await cur.fetchall()
 
-    async def update_target_meta(self, tg_id: int, chat_id: int, title: str = None, enabled: Optional[bool] = None):
+    async def remove_target(self, tg_id: int, chat_id: int):
         async with aiosqlite.connect(self.db_path) as db:
-            if title is not None:
-                await db.execute("UPDATE targets SET title=?, last_verified_at=? WHERE tg_id=? AND chat_id=?", (title, int(time.time()), tg_id, chat_id))
-            if enabled is not None:
-                await db.execute("UPDATE targets SET enabled=? WHERE tg_id=? AND chat_id=?", (1 if enabled else 0, tg_id, chat_id))
+            await db.execute("DELETE FROM targets WHERE tg_id=? AND chat_id=?", (tg_id, int(chat_id)))
             await db.commit()
 
-    async def targets_due(self, tg_id: int, now_ts: int) -> List[int]:
-        """Return chat_ids that are due to receive a post (>=30m since last_send and no cooldown)."""
+    async def due_targets(self, tg_id: int, now_ts: int) -> List[int]:
+        """
+        Return chat_ids where:
+          - cooldown_until is NULL or <= now
+          - last_send_at is NULL or <= now - 1800 (30 min)
+        """
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute("""
                 SELECT chat_id FROM targets
                 WHERE tg_id=?
-                AND enabled=1
-                AND (cooldown_until IS NULL OR cooldown_until<=?)
-                AND (last_send_at IS NULL OR last_send_at<=? - 1800)
-                ORDER BY last_send_at NULLS FIRST
-            """, (tg_id, now_ts, now_ts))
+                  AND (cooldown_until IS NULL OR cooldown_until<=?)
+                  AND (last_send_at IS NULL OR last_send_at<=?)
+                ORDER BY (last_send_at IS NOT NULL), last_send_at
+            """, (tg_id, now_ts, now_ts - 1800))
             rows = await cur.fetchall()
             return [r[0] for r in rows]
 
     async def mark_sent(self, tg_id: int, chat_id: int):
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE targets SET last_send_at=? WHERE tg_id=? AND chat_id=?", (int(time.time()), tg_id, chat_id))
+            await db.execute("UPDATE targets SET last_send_at=? WHERE tg_id=? AND chat_id=?", (int(time.time()), tg_id, int(chat_id)))
             await db.commit()
 
     async def set_cooldown(self, tg_id: int, chat_id: int, seconds: int):
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE targets SET cooldown_until=? WHERE tg_id=? AND chat_id=?", (int(time.time())+seconds, tg_id, chat_id))
+            await db.execute("UPDATE targets SET cooldown_until=? WHERE tg_id=? AND chat_id=?", (int(time.time()) + int(seconds), tg_id, int(chat_id)))
             await db.commit()
 
-    async def inc_fail(self, tg_id: int, chat_id: int) -> int:
+    async def inc_fail(self, tg_id: int, chat_id: int):
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT fail_count FROM targets WHERE tg_id=? AND chat_id=?", (tg_id, chat_id))
-            row = await cur.fetchone()
-            fails = (row[0] if row else 0) + 1
-            await db.execute("UPDATE targets SET fail_count=? WHERE tg_id=? AND chat_id=?", (fails, tg_id, chat_id))
+            await db.execute("UPDATE targets SET fail_count=COALESCE(fail_count,0)+1 WHERE tg_id=? AND chat_id=?", (tg_id, int(chat_id)))
             await db.commit()
-            return fails
 
     async def reset_fail(self, tg_id: int, chat_id: int):
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE targets SET fail_count=0 WHERE tg_id=? AND chat_id=?", (tg_id, chat_id))
+            await db.execute("UPDATE targets SET fail_count=0 WHERE tg_id=? AND chat_id=?", (tg_id, int(chat_id)))
             await db.commit()
 
-    # --- Audit ---
+    # -------------- Audit --------------
     async def audit(self, tg_id: int, action: str, payload: Dict[str, Any] = None):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("INSERT INTO audit(tg_id, action, payload, ts) VALUES (?,?,?,?)",
@@ -222,6 +224,6 @@ class Storage:
 
     async def last_audit(self, tg_id: int, limit: int = 10):
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT action, payload, ts FROM audit WHERE tg_id=? ORDER BY id DESC LIMIT ?", (tg_id, limit))
-            rows = await cur.fetchall()
-            return rows
+            cur = await db.execute("SELECT action, payload, ts FROM audit WHERE tg_id=? ORDER BY id DESC LIMIT ?", (tg_id, int(limit)))
+            return await cur.fetchall()
+            
