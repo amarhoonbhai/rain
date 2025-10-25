@@ -1,11 +1,10 @@
 aiogram==2.25.2
 aiohttp==3.8.6
-Babel==2.9.1
 aiosqlite==0.20.0
-APScheduler==3.10.4
 python-dotenv==1.0.1
 cryptography==43.0.1
-pytz==2024.2
 Telethon==1.33.1
+Babel==2.9.1
+pytz==2024.2
 certifi>=2021.10.8
 magic-filter>=1.0.9
