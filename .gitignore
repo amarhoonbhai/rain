@@ -1,17 +1,19 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-.venv/
+*.py[cod]
+*$py.class
+
+# Environment
 .env
-env/
 
-# OS / editors
+# SQLite
+data/
+*.sqlite
+
+# Virtualenv
+.venv/
+venv/
+
+# OS
 .DS_Store
-.idea/
-.vscode/
-
-# Archives
-*.zip
-
-# Logs
-*.log
+Thumbs.db
