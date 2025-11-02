@@ -1,7 +1,3 @@
-Got it. Here is the final **login_bot.py** with **only reply keyboards** (no inline anywhere):
-
-```python
-# login_bot.py
 import asyncio
 import os
 from aiogram import Bot, Dispatcher
@@ -60,7 +56,8 @@ async def get_api_id(msg: Message, state: FSMContext):
     try:
         api_id = int(msg.text.strip())
     except ValueError:
-        return await msg.answer("API ID must be a number. Send again.")
+        await msg.answer("API ID must be a number. Send again.")
+        return
     await state.update_data(api_id=api_id)
     await msg.answer("OK. Now send your API HASH.")
     await state.set_state(Login.api_hash)
@@ -115,21 +112,25 @@ async def otp_input(msg: Message, state: FSMContext):
     if txt == "🧹 Clear":
         code = ""
         await state.update_data(code=code)
-        return await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_kb())
+        await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_kb())
+        return
 
     if txt == "⬅️ Back":
         code = code[:-1]
         await state.update_data(code=code)
-        return await msg.answer(f"Code: {code}", reply_markup=otp_kb())
+        await msg.answer(f"Code: {code}", reply_markup=otp_kb())
+        return
 
     if txt == "✅ Submit":
         if not code:
-            return await msg.answer("Enter the code first.", reply_markup=otp_kb())
-        # go to sign-in
+            await msg.answer("Enter the code first.", reply_markup=otp_kb())
+            return
+        # continue to sign in below
     elif txt.isdigit():
         code += txt
         await state.update_data(code=code)
-        return await msg.answer(f"Code: {code}", reply_markup=otp_kb())
+        await msg.answer(f"Code: {code}", reply_markup=otp_kb())
+        return
     else:
         return
 
@@ -150,15 +151,18 @@ async def otp_input(msg: Message, state: FSMContext):
         new_sent = await client.send_code(phone)
         await client.disconnect()
         await state.update_data(phone_code_hash=new_sent.phone_code_hash, code="")
-        return await msg.answer("Code expired. New code sent.\nVerification Code\nUse the keypad below.", reply_markup=otp_kb())
+        await msg.answer("Code expired. New code sent.\nVerification Code\nUse the keypad below.", reply_markup=otp_kb())
+        return
     except PhoneCodeInvalid:
         await client.disconnect()
         await state.update_data(code="")
-        return await msg.answer("Wrong code. Try again.\nVerification Code\nUse the keypad below.", reply_markup=otp_kb())
+        await msg.answer("Wrong code. Try again.\nVerification Code\nUse the keypad below.", reply_markup=otp_kb())
+        return
     except Exception as e:
         await client.disconnect()
         await state.clear()
-        return await msg.answer(f"Login failed: {e}\n/start again")
+        await msg.answer(f"Login failed: {e}\n/start again")
+        return
 
     session_str = await client.export_session_string()
 
@@ -173,14 +177,12 @@ async def otp_input(msg: Message, state: FSMContext):
     await client.disconnect()
 
     conn = get_conn()
-    conn.execute("""
-        INSERT INTO user_sessions(user_id, api_id, api_hash, session_string)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            api_id=excluded.api_id,
-            api_hash=excluded.api_hash,
-            session_string=excluded.session_string
-    """, (msg.from_user.id, api_id, api_hash, session_str))
+    conn.execute(
+        "INSERT INTO user_sessions(user_id, api_id, api_hash, session_string) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET api_id=excluded.api_id, api_hash=excluded.api_hash, session_string=excluded.session_string",
+        (msg.from_user.id, api_id, api_hash, session_str)
+    )
     conn.commit()
     conn.close()
 
@@ -194,4 +196,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-```
+    
