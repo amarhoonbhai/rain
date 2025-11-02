@@ -10,7 +10,7 @@ from core.db import init_db, get_conn
 load_dotenv()
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-REQUIRED_CHANNELS = ["@PhiloBots", "@Spinify"]
+REQUIRED_CHANNELS = ["@PhiloBots", "@ThetrafficZone"]
 
 bot = Bot(MAIN_BOT_TOKEN)
 dp = Dispatcher()
