@@ -1,6 +1,6 @@
 import asyncio
 import os
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
@@ -18,7 +18,6 @@ dp = Dispatcher()
 init_db()
 
 
-# ---------- states ----------
 class Login(StatesGroup):
     api_id = State()
     api_hash = State()
@@ -26,7 +25,6 @@ class Login(StatesGroup):
     otp = State()
 
 
-# ---------- keypads ----------
 def phone_kb():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 Send phone", request_contact=True)]],
@@ -40,17 +38,16 @@ def otp_kb():
             [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
             [KeyboardButton(text="4"), KeyboardButton(text="5"), KeyboardButton(text="6")],
             [KeyboardButton(text="7"), KeyboardButton(text="8"), KeyboardButton(text="9")],
-            [KeyboardButton(text="0"), KeyboardButton(text="✅ OK")],
-            [KeyboardButton(text="⬅️"), KeyboardButton(text="❌ Cancel")],
+            [KeyboardButton(text="0")],
+            [KeyboardButton(text="⬅️ Back"), KeyboardButton(text="🧹 Clear"), KeyboardButton(text="✅ Submit")],
         ],
         resize_keyboard=True
     )
 
 
-# ---------- handlers ----------
 @dp.message(Command("start"))
 async def start(msg: Message, state: FSMContext):
-    await msg.answer("🔐 Send your *API ID* (number)", parse_mode="Markdown")
+    await msg.answer("Send your API ID (number).")
     await state.set_state(Login.api_id)
 
 
@@ -59,9 +56,9 @@ async def get_api_id(msg: Message, state: FSMContext):
     try:
         api_id = int(msg.text.strip())
     except ValueError:
-        return await msg.answer("❗ API ID must be a number. Send again.")
+        return await msg.answer("API ID must be a number. Send again.")
     await state.update_data(api_id=api_id)
-    await msg.answer("✅ Got API ID.\nNow send your *API HASH*.", parse_mode="Markdown")
+    await msg.answer("OK. Now send your API HASH.")
     await state.set_state(Login.api_hash)
 
 
@@ -69,42 +66,7 @@ async def get_api_id(msg: Message, state: FSMContext):
 async def get_api_hash(msg: Message, state: FSMContext):
     api_hash = msg.text.strip()
     await state.update_data(api_hash=api_hash)
-    await msg.answer("📞 Now send your phone (with country code) or tap below.", reply_markup=phone_kb())
-    await state.set_state(Login.phone)
-
-
-@dp.message(Login.phone)
-async def get_phone(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    api_id = data["api_id"]
-    api_hash = data["api_hash"]
-
-    if msg.contact:
-        phone = msg.contact.phone_number
-    else:
-        phone = msg.text.strip()
-
-    # send code
-    client = Client(
-        name=f"login-{msg.from_user.id}",
-        api_id=api_id,
-        api_hash=api_hash,
-        in_memory=True,
-    )
-    await client.connect()
-    sent = await client.send_code(phone)
-    await client.disconnect()
-
-    # store temp
-    await state.update_data(phone=phone, phone_code_hash=sent.phone_code_hash, code="")
-    await msg.answer("📨 Code sent. Enter with keypad 👇", reply_markup=otp_kb())
-    await state.set_state(Login.otp)
-
-
-@dp.message(Login.otp)
-async def otp_input(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    api_id = data["api_id"]
+    await msg.answer("Now send you
     api_hash = data["api_hash"]
     phone = data["phone"]
     phone_code_hash = data["phone_code_hash"]
