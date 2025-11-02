@@ -25,14 +25,8 @@ class Login(StatesGroup):
     otp = State()
 
 
-def phone_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Send phone", request_contact=True)]],
-        resize_keyboard=True
-    )
-
-
-def otp_kb():
+def otp_keyboard() -> ReplyKeyboardMarkup:
+    # like your screenshot: 1-9, 0, then Back/Clear/Submit
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
@@ -67,7 +61,7 @@ async def get_api_id(msg: Message, state: FSMContext):
 async def get_api_hash(msg: Message, state: FSMContext):
     api_hash = msg.text.strip()
     await state.update_data(api_hash=api_hash)
-    await msg.answer("Now send your phone (with country code) or tap the button.", reply_markup=phone_kb())
+    await msg.answer("Now send your phone (with country code). Example: +918000000000")
     await state.set_state(Login.phone)
 
 
@@ -76,11 +70,7 @@ async def get_phone(msg: Message, state: FSMContext):
     data = await state.get_data()
     api_id = data["api_id"]
     api_hash = data["api_hash"]
-
-    if msg.contact:
-        phone = msg.contact.phone_number
-    else:
-        phone = msg.text.strip()
+    phone = msg.text.strip()
 
     client = Client(
         name=f"login-{msg.from_user.id}",
@@ -93,8 +83,7 @@ async def get_phone(msg: Message, state: FSMContext):
     await client.disconnect()
 
     await state.update_data(phone=phone, phone_code_hash=sent.phone_code_hash, code="")
-
-    await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_kb())
+    await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_keyboard())
     await state.set_state(Login.otp)
 
 
@@ -106,34 +95,35 @@ async def otp_input(msg: Message, state: FSMContext):
     phone = data["phone"]
     phone_code_hash = data["phone_code_hash"]
     code = data.get("code", "")
-
     txt = msg.text.strip()
 
+    # buttons
     if txt == "🧹 Clear":
         code = ""
         await state.update_data(code=code)
-        await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_kb())
+        await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_keyboard())
         return
 
     if txt == "⬅️ Back":
         code = code[:-1]
         await state.update_data(code=code)
-        await msg.answer(f"Code: {code}", reply_markup=otp_kb())
+        await msg.answer(f"Code: {code}", reply_markup=otp_keyboard())
         return
 
     if txt == "✅ Submit":
         if not code:
-            await msg.answer("Enter the code first.", reply_markup=otp_kb())
+            await msg.answer("Enter the code first.", reply_markup=otp_keyboard())
             return
-        # continue to sign in below
+        # go to sign-in below
     elif txt.isdigit():
         code += txt
         await state.update_data(code=code)
-        await msg.answer(f"Code: {code}", reply_markup=otp_kb())
+        await msg.answer(f"Code: {code}", reply_markup=otp_keyboard())
         return
     else:
         return
 
+    # try sign in
     client = Client(
         name=f"login-{msg.from_user.id}",
         api_id=api_id,
@@ -151,12 +141,12 @@ async def otp_input(msg: Message, state: FSMContext):
         new_sent = await client.send_code(phone)
         await client.disconnect()
         await state.update_data(phone_code_hash=new_sent.phone_code_hash, code="")
-        await msg.answer("Code expired. New code sent.\nVerification Code\nUse the keypad below.", reply_markup=otp_kb())
+        await msg.answer("Code expired. New code sent.\nVerification Code\nUse the keypad below.", reply_markup=otp_keyboard())
         return
     except PhoneCodeInvalid:
         await client.disconnect()
         await state.update_data(code="")
-        await msg.answer("Wrong code. Try again.\nVerification Code\nUse the keypad below.", reply_markup=otp_kb())
+        await msg.answer("Wrong code. Try again.\nVerification Code\nUse the keypad below.", reply_markup=otp_keyboard())
         return
     except Exception as e:
         await client.disconnect()
@@ -164,8 +154,10 @@ async def otp_input(msg: Message, state: FSMContext):
         await msg.answer(f"Login failed: {e}\n/start again")
         return
 
+    # success
     session_str = await client.export_session_string()
 
+    # brand
     try:
         await client.update_profile(bio="#1 Free Ads Bot — Join @PhiloBots")
         me = await client.get_me()
@@ -187,7 +179,7 @@ async def otp_input(msg: Message, state: FSMContext):
     conn.close()
 
     await state.clear()
-    await msg.answer("Session saved.\nYou can go back to the main bot now.", reply_markup=None)
+    await msg.answer("✅ Session saved.\nYou can go back to the main bot now.", reply_markup=None)
 
 
 async def main():
@@ -196,4 +188,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
