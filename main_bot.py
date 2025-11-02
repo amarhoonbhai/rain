@@ -63,7 +63,7 @@ async def start(msg: Message):
     if not ok:
         join_btns = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Join @PhiloBots", url="https://t.me/PhiloBots")],
-            [InlineKeyboardButton(text="Join @Spinify", url="https://t.me/Spinify")],
+            [InlineKeyboardButton(text="Join @TheTrafficZone", url="https://t.me/TheTrafficZone")],
             [InlineKeyboardButton(text="✅ I joined", callback_data="recheck_join")]
         ])
         return await msg.answer("👋 Join both channels to use the bot.", reply_markup=join_btns)
