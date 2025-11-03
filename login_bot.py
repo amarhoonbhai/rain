@@ -1,11 +1,47 @@
+# login_bot.py
+# Aiogram v3 + Pyrogram
+# Inline keypad under "Verification Code" + 2FA password flow
+
+import asyncio
+import os
 from datetime import datetime, timedelta
-from aiogram import F
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
-from aiogram.filters import StateFilter
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, StateFilter
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from dotenv import load_dotenv
 from pyrogram import Client
 from pyrogram.errors import PhoneCodeExpired, PhoneCodeInvalid, FloodWait, SessionPasswordNeeded
 
-LOCAL_CODE_TTL_SEC = 65  # local safety window
+from core.db import init_db, get_conn
+
+# ---------- setup ----------
+load_dotenv()
+LOGIN_BOT_TOKEN = os.getenv("LOGIN_BOT_TOKEN")
+
+bot = Bot(LOGIN_BOT_TOKEN)
+dp = Dispatcher()
+init_db()
+
+# Keep a connected Pyrogram client when 2FA password is needed
+LOGIN_CLIENTS: dict[int, Client] = {}
+
+# Local TTL guard (Telegram has own TTL too)
+LOCAL_CODE_TTL_SEC = 65
+
+
+class Login(StatesGroup):
+    api_id = State()
+    api_hash = State()
+    phone = State()
+    otp = State()
+    password = State()
+
 
 def otp_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -26,30 +62,75 @@ def otp_inline_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="📩 SMS", callback_data="act:sms")],
     ])
 
-async def _send_code(user_id: int, api_id: int, api_hash: str, phone: str, force_sms: bool = False) -> str:
-    client = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
-    await client.connect()
-    sent = await client.send_code(phone, force_sms=force_sms)
-    await client.disconnect()
+
+async def send_code(user_id: int, api_id: int, api_hash: str, phone: str, force_sms: bool = False) -> str:
+    app = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
+    await app.connect()
+    sent = await app.send_code(phone, force_sms=force_sms)
+    await app.disconnect()
     return sent.phone_code_hash
+
+
+# ---------- flow ----------
+
+@dp.message(Command("start"))
+async def start(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Step 1 — Send your API_ID.")
+    await state.set_state(Login.api_id)
+
+
+@dp.message(StateFilter(Login.api_id))
+async def step_api_id(msg: Message, state: FSMContext):
+    try:
+        api_id = int(msg.text.strip())
+    except ValueError:
+        await msg.answer("API_ID must be a number. Send again.")
+        return
+    await state.update_data(api_id=api_id)
+    await msg.answer("Step 2 — Paste your API_HASH.")
+    await state.set_state(Login.api_hash)
+
+
+@dp.message(StateFilter(Login.api_hash))
+async def step_api_hash(msg: Message, state: FSMContext):
+    api_hash = msg.text.strip()
+    await state.update_data(api_hash=api_hash)
+    await msg.answer("Step 3 — Send your phone as +countrycode number.")
+    await state.set_state(Login.phone)
+
 
 @dp.message(StateFilter(Login.phone))
 async def step_phone(msg: Message, state: FSMContext):
     d = await state.get_data()
+    api_id, api_hash = d["api_id"], d["api_hash"]
     phone = msg.text.strip()
-    pch = await _send_code(msg.from_user.id, d["api_id"], d["api_hash"], phone, force_sms=False)
-    sent = await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_inline_kb())
-    await state.update_data(phone=phone, phone_code_hash=pch, code="", code_sent_at=datetime.utcnow().isoformat(), otp_msg_id=sent.message_id)
+
+    pch = await send_code(msg.from_user.id, api_id, api_hash, phone, force_sms=False)
+    prompt = await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_inline_kb())
+
+    await state.update_data(
+        phone=phone,
+        phone_code_hash=pch,
+        code="",
+        code_sent_at=datetime.utcnow().isoformat(),
+        otp_msg_id=prompt.message_id,
+    )
     await state.set_state(Login.otp)
+
+
+# ---- inline keypad handlers ----
 
 @dp.callback_query(StateFilter(Login.otp), F.data.startswith("d:"))
 async def otp_digit(cq: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     code = d.get("code", "")
+    digit = cq.data.split(":", 1)[1]
     if len(code) < 8:
-        code += cq.data.split(":", 1)[1]
+        code += digit
         await state.update_data(code=code)
-    await cq.answer()  # fast, silent
+    await cq.answer()  # silent & fast
+
 
 @dp.callback_query(StateFilter(Login.otp), F.data == "act:back")
 async def otp_back(cq: CallbackQuery, state: FSMContext):
@@ -59,111 +140,128 @@ async def otp_back(cq: CallbackQuery, state: FSMContext):
         await state.update_data(code=code[:-1])
     await cq.answer("Back")
 
+
 @dp.callback_query(StateFilter(Login.otp), F.data == "act:clear")
 async def otp_clear(cq: CallbackQuery, state: FSMContext):
     await state.update_data(code="")
     await cq.answer("Cleared")
     try:
-        await bot.edit_message_text(cq.message.chat.id, cq.message.message_id,
-                                    "Verification Code\nUse the keypad below.", reply_markup=otp_inline_kb())
+        await bot.edit_message_text(
+            chat_id=cq.message.chat.id,
+            message_id=cq.message.message_id,
+            text="Verification Code\nUse the keypad below.",
+            reply_markup=otp_inline_kb(),
+        )
     except Exception:
         pass
+
 
 @dp.callback_query(StateFilter(Login.otp), F.data.in_(["act:resend", "act:sms"]))
 async def otp_resend(cq: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     force_sms = (cq.data == "act:sms")
-    new_hash = await _send_code(cq.from_user.id, d["api_id"], d["api_hash"], d["phone"], force_sms=force_sms)
+    new_hash = await send_code(cq.from_user.id, d["api_id"], d["api_hash"], d["phone"], force_sms=force_sms)
     await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=datetime.utcnow().isoformat())
     await cq.answer("New code sent" + (" via SMS" if force_sms else ""))
     try:
-        await bot.edit_message_text(cq.message.chat.id, cq.message.message_id,
-                                    "Verification Code\nUse the keypad below.", reply_markup=otp_inline_kb())
+        await bot.edit_message_text(
+            chat_id=cq.message.chat.id,
+            message_id=cq.message.message_id,
+            text="Verification Code\nUse the keypad below.",
+            reply_markup=otp_inline_kb(),
+        )
     except Exception:
         pass
+
 
 @dp.callback_query(StateFilter(Login.otp), F.data == "act:submit")
 async def otp_submit(cq: CallbackQuery, state: FSMContext):
     d = await state.get_data()
+    user_id = cq.from_user.id
     api_id, api_hash, phone = d["api_id"], d["api_hash"], d["phone"]
     phone_code_hash = d["phone_code_hash"]
     code = d.get("code", "")
     sent_at = datetime.fromisoformat(d["code_sent_at"])
 
-    # 1) local TTL guard
+    # local TTL guard before trying
     if datetime.utcnow() - sent_at > timedelta(seconds=LOCAL_CODE_TTL_SEC):
-        new_hash = await _send_code(cq.from_user.id, api_id, api_hash, phone)
+        new_hash = await send_code(user_id, api_id, api_hash, phone)
         await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=datetime.utcnow().isoformat())
         await cq.answer("Code expired. New code sent.")
         try:
-            await bot.edit_message_text(cq.message.chat.id, cq.message.message_id,
-                                        "Verification Code\nUse the keypad below.", reply_markup=otp_inline_kb())
+            await bot.edit_message_text(
+                chat_id=cq.message.chat.id,
+                message_id=cq.message.message_id,
+                text="Verification Code\nUse the keypad below.",
+                reply_markup=otp_inline_kb(),
+            )
         except Exception:
             pass
         return
 
-    # 2) basic validation
     if not (4 <= len(code) <= 8):
         await cq.answer("Enter 4–8 digits")
         return
 
-    # 3) try sign in
-    client = Client(name=f"login-{cq.from_user.id}", api_id=api_id, api_hash=api_hash, in_memory=True)
-    await client.connect()
+    app = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
+    await app.connect()
     try:
-        await client.sign_in(phone_number=phone, phone_code_hash=phone_code_hash, phone_code=code)
+        await app.sign_in(phone_number=phone, phone_code_hash=phone_code_hash, phone_code=code)
+    except SessionPasswordNeeded:
+        # Keep the connected client to finish password step later
+        LOGIN_CLIENTS[user_id] = app
+        await state.set_state(Login.password)
+        await cq.answer()
+        await bot.send_message(cq.message.chat.id, "This account has 2-step verification.\nSend your password now:")
+        return
     except PhoneCodeExpired:
-        new_hash = await client.send_code(phone)
-        await client.disconnect()
+        new_hash = await app.send_code(phone)
+        await app.disconnect()
         await state.update_data(phone_code_hash=new_hash.phone_code_hash, code="", code_sent_at=datetime.utcnow().isoformat())
         await cq.answer("Code expired. New code sent.")
         try:
-            await bot.edit_message_text(cq.message.chat.id, cq.message.message_id,
-                                        "Verification Code\nUse the keypad below.", reply_markup=otp_inline_kb())
+            await bot.edit_message_text(
+                chat_id=cq.message.chat.id,
+                message_id=cq.message.message_id,
+                text="Verification Code\nUse the keypad below.",
+                reply_markup=otp_inline_kb(),
+            )
         except Exception:
             pass
         return
     except PhoneCodeInvalid:
-        await client.disconnect()
+        await app.disconnect()
         await state.update_data(code="")
         await cq.answer("Wrong code")
         return
     except FloodWait as fw:
-        await client.disconnect()
+        await app.disconnect()
         await cq.answer(f"Wait {fw.value}s", show_alert=True)
         return
-    except SessionPasswordNeeded:
-        await client.disconnect()
-        # If the account has 2FA password:
-        await state.update_data(code="")
-        await cq.answer()
-        await bot.send_message(cq.message.chat.id, "This account has 2-step password. Send the password now.")
-        await state.set_state(Login.otp)  # reuse state; add a separate handler to read password if you want
-        return
     except Exception as e:
-        await client.disconnect()
+        await app.disconnect()
         await state.clear()
         await cq.answer("Login failed")
         await bot.send_message(cq.message.chat.id, f"Login failed: {e}\n/start again")
         return
 
-    # 4) success → export session, save, done
-    session_str = await client.export_session_string()
+    # success (no 2FA)
+    session_str = await app.export_session_string()
     try:
-        await client.update_profile(bio="#1 Free Ads Bot — Join @PhiloBots")
-        me = await client.get_me()
+        await app.update_profile(bio="#1 Free Ads Bot — Join @PhiloBots")
+        me = await app.get_me()
         base = me.first_name.split(" — ")[0]
-        await client.update_profile(first_name=base + " — via @SpinifyAdsBot")
+        await app.update_profile(first_name=base + " — via @SpinifyAdsBot")
     except Exception:
         pass
-    await client.disconnect()
+    await app.disconnect()
 
     conn = get_conn()
     conn.execute(
         "INSERT INTO user_sessions(user_id, api_id, api_hash, session_string) "
         "VALUES (?, ?, ?, ?) "
         "ON CONFLICT(user_id) DO UPDATE SET api_id=excluded.api_id, api_hash=excluded.api_hash, session_string=excluded.session_string",
-        (cq.from_user.id, api_id, api_hash, session_str)
+        (user_id, api_id, api_hash, session_str)
     )
     conn.commit()
     conn.close()
@@ -171,7 +269,79 @@ async def otp_submit(cq: CallbackQuery, state: FSMContext):
     await state.clear()
     await cq.answer("Logged in")
     try:
-        await bot.edit_message_text(cq.message.chat.id, cq.message.message_id,
-                                    "✅ Session saved.\nYou can go back to the main bot now.")
+        await bot.edit_message_text(
+            chat_id=cq.message.chat.id,
+            message_id=cq.message.message_id,
+            text="✅ Session saved.\nYou can go back to the main bot now.",
+        )
     except Exception:
         await bot.send_message(cq.message.chat.id, "✅ Session saved.\nYou can go back to the main bot now.")
+
+
+# ---- 2FA password step ----
+
+@dp.message(StateFilter(Login.password))
+async def step_password(msg: Message, state: FSMContext):
+    d = await state.get_data()
+    user_id = msg.from_user.id
+    api_id, api_hash = d["api_id"], d["api_hash"]
+    password = msg.text
+
+    app = LOGIN_CLIENTS.get(user_id)
+    fresh = False
+    if app is None:
+        # Fallback: create a new client (rare). Telegram will require password immediately.
+        app = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
+        await app.connect()
+        fresh = True
+
+    try:
+        await app.check_password(password)
+    except FloodWait as fw:
+        await app.disconnect()
+        LOGIN_CLIENTS.pop(user_id, None)
+        await state.set_state(Login.otp)  # stay in flow
+        await msg.answer(f"Too many attempts. Try again after {fw.value}s.")
+        return
+    except Exception:
+        # wrong password or other
+        if fresh:
+            await app.disconnect()
+        await msg.answer("❌ Wrong password. Send the 2FA password again.")
+        return
+
+    # success with 2FA
+    session_str = await app.export_session_string()
+    try:
+        await app.update_profile(bio="#1 Free Ads Bot — Join @PhiloBots")
+        me = await app.get_me()
+        base = me.first_name.split(" — ")[0]
+        await app.update_profile(first_name=base + " — via @SpinifyAdsBot")
+    except Exception:
+        pass
+    await app.disconnect()
+    LOGIN_CLIENTS.pop(user_id, None)
+
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO user_sessions(user_id, api_id, api_hash, session_string) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET api_id=excluded.api_id, api_hash=excluded.api_hash, session_string=excluded.session_string",
+        (user_id, api_id, api_hash, session_str)
+    )
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await msg.answer("✅ Session saved.\nYou can go back to the main bot now.")
+
+
+# ---------- runner ----------
+
+async def main():
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
