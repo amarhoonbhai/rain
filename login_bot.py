@@ -1,6 +1,6 @@
 # login_bot.py
 # Aiogram v3 + Pyrogram
-# Inline keypad under "Verification Code" + 2FA password flow
+# Inline keypad under "Verification Code" + 2FA password flow (no force_sms)
 
 import asyncio
 import os
@@ -31,7 +31,7 @@ init_db()
 # Keep a connected Pyrogram client when 2FA password is needed
 LOGIN_CLIENTS: dict[int, Client] = {}
 
-# Local TTL guard (Telegram has own TTL too)
+# Local TTL guard (Telegram has own TTL as well)
 LOCAL_CODE_TTL_SEC = 65
 
 
@@ -58,15 +58,15 @@ def otp_inline_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅ Back", callback_data="act:back"),
          InlineKeyboardButton(text="🧹 Clear", callback_data="act:clear"),
          InlineKeyboardButton(text="✔ Submit", callback_data="act:submit")],
-        [InlineKeyboardButton(text="🔁 Resend", callback_data="act:resend"),
-         InlineKeyboardButton(text="📩 SMS", callback_data="act:sms")],
+        [InlineKeyboardButton(text="🔁 Resend", callback_data="act:resend")],
     ])
 
 
-async def send_code(user_id: int, api_id: int, api_hash: str, phone: str, force_sms: bool = False) -> str:
+async def send_code(user_id: int, api_id: int, api_hash: str, phone: str) -> str:
+    """Send Telegram login code. Compatible with Pyrogram versions without force_sms."""
     app = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
     await app.connect()
-    sent = await app.send_code(phone, force_sms=force_sms)
+    sent = await app.send_code(phone)  # no force_sms here
     await app.disconnect()
     return sent.phone_code_hash
 
@@ -106,7 +106,12 @@ async def step_phone(msg: Message, state: FSMContext):
     api_id, api_hash = d["api_id"], d["api_hash"]
     phone = msg.text.strip()
 
-    pch = await send_code(msg.from_user.id, api_id, api_hash, phone, force_sms=False)
+    try:
+        pch = await send_code(msg.from_user.id, api_id, api_hash, phone)
+    except Exception as e:
+        await msg.answer(f"Could not send code: {e}")
+        return
+
     prompt = await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_inline_kb())
 
     await state.update_data(
@@ -156,13 +161,18 @@ async def otp_clear(cq: CallbackQuery, state: FSMContext):
         pass
 
 
-@dp.callback_query(StateFilter(Login.otp), F.data.in_(["act:resend", "act:sms"]))
+@dp.callback_query(StateFilter(Login.otp), F.data == "act:resend")
 async def otp_resend(cq: CallbackQuery, state: FSMContext):
     d = await state.get_data()
-    force_sms = (cq.data == "act:sms")
-    new_hash = await send_code(cq.from_user.id, d["api_id"], d["api_hash"], d["phone"], force_sms=force_sms)
+    try:
+        new_hash = await send_code(cq.from_user.id, d["api_id"], d["api_hash"], d["phone"])
+    except Exception as e:
+        await cq.answer("Resend failed")
+        await bot.send_message(cq.message.chat.id, f"Could not resend code: {e}")
+        return
+
     await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=datetime.utcnow().isoformat())
-    await cq.answer("New code sent" + (" via SMS" if force_sms else ""))
+    await cq.answer("New code sent")
     try:
         await bot.edit_message_text(
             chat_id=cq.message.chat.id,
@@ -183,9 +193,14 @@ async def otp_submit(cq: CallbackQuery, state: FSMContext):
     code = d.get("code", "")
     sent_at = datetime.fromisoformat(d["code_sent_at"])
 
-    # local TTL guard before trying
+    # Local TTL guard before trying
     if datetime.utcnow() - sent_at > timedelta(seconds=LOCAL_CODE_TTL_SEC):
-        new_hash = await send_code(user_id, api_id, api_hash, phone)
+        try:
+            new_hash = await send_code(user_id, api_id, api_hash, phone)
+        except Exception as e:
+            await cq.answer("Resend failed")
+            await bot.send_message(cq.message.chat.id, f"Could not resend code: {e}")
+            return
         await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=datetime.utcnow().isoformat())
         await cq.answer("Code expired. New code sent.")
         try:
@@ -290,7 +305,7 @@ async def step_password(msg: Message, state: FSMContext):
     app = LOGIN_CLIENTS.get(user_id)
     fresh = False
     if app is None:
-        # Fallback: create a new client (rare). Telegram will require password immediately.
+        # Rare fallback: open a fresh client; Telegram will immediately ask for password
         app = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
         await app.connect()
         fresh = True
@@ -304,7 +319,6 @@ async def step_password(msg: Message, state: FSMContext):
         await msg.answer(f"Too many attempts. Try again after {fw.value}s.")
         return
     except Exception:
-        # wrong password or other
         if fresh:
             await app.disconnect()
         await msg.answer("❌ Wrong password. Send the 2FA password again.")
@@ -344,4 +358,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
