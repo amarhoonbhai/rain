@@ -1,9 +1,8 @@
-# login_bot.py
-# Aiogram v3 + Pyrogram
-# Inline OTP keypad + shows delivery method (SMS/App/Call) + Resend/Call + 2FA password
-
 import asyncio
 import os
+import sys
+import pathlib
+import datetime
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -17,13 +16,17 @@ from aiogram.fsm.context import FSMContext
 from dotenv import load_dotenv
 
 from pyrogram import Client
-from pyrogram.errors import PhoneCodeExpired, PhoneCodeInvalid, FloodWait, SessionPasswordNeeded
-from pyrogram.raw.functions.auth import SendCode as RawSendCode
+from pyrogram.errors import (
+    PhoneCodeExpired, PhoneCodeInvalid, FloodWait, SessionPasswordNeeded,
+    ApiIdInvalid, PhoneNumberInvalid, PhoneNumberFlood, PhoneNumberBanned
+)
+from pyrogram.raw.functions.auth import SendCode as RawSendCode, ResendCode as RawResendCode
 from pyrogram.raw.types import CodeSettings
 
 from core.db import init_db, get_conn
 
-# ---------------- setup ----------------
+
+# ---------------- env & bot ----------------
 load_dotenv()
 LOGIN_BOT_TOKEN = os.getenv("LOGIN_BOT_TOKEN")
 
@@ -31,11 +34,25 @@ bot = Bot(LOGIN_BOT_TOKEN)
 dp = Dispatcher()
 init_db()
 
-# keep connected Pyrogram client for 2FA
-LOGIN_CLIENTS: dict[int, Client] = {}
 
-# local guard before trying sign_in (Telegram has its own)
-LOCAL_CODE_TTL_SEC = 65
+# ---------------- logging ----------------
+LOG_DIR = pathlib.Path(__file__).with_name("logs")
+LOG_DIR.mkdir(exist_ok=True)
+_log_f = open(LOG_DIR / "login_bot.log", "a", buffering=1)
+
+def log(*parts):
+    ts = datetime.utcnow().isoformat()
+    line = "[login_bot] " + ts + " " + " ".join(map(str, parts))
+    print(line, flush=True)
+    try:
+        _log_f.write(line + "\n"); _log_f.flush()
+    except Exception:
+        pass
+
+
+# ---------------- state & const ----------------
+LOGIN_CLIENTS: dict[int, Client] = {}
+LOCAL_CODE_TTL_SEC = 65  # local guard (Telegram has its own TTL)
 
 
 class Login(StatesGroup):
@@ -46,6 +63,7 @@ class Login(StatesGroup):
     password = State()
 
 
+# ---------------- UI (inline keypad) ----------------
 def otp_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1", callback_data="d:1"),
@@ -63,51 +81,66 @@ def otp_inline_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="✔ Submit", callback_data="act:submit")],
         [InlineKeyboardButton(text="🔁 Resend", callback_data="act:resend"),
          InlineKeyboardButton(text="📞 Call",   callback_data="act:call"),
-         InlineKeyboardButton(text="ℹ️ Status", callback_data="act:status")],
+         InlineKeyboardButton(text="🔄 Alt",    callback_data="act:alt")],
+        [InlineKeyboardButton(text="ℹ️ Status", callback_data="act:status")],
     ])
 
 
 def _delivery_label_from_sent(sent) -> str:
-    """Best-effort parse of delivery type from SentCode."""
     t = getattr(sent, "type", None)
     tname = getattr(t, "_", "") if t else ""
-    tn = tname.lower()
-    if "sms" in tn:
-        return "SMS"
-    if "app" in tn:
-        return "Telegram app"
-    if "call" in tn and "flash" not in tn:
-        return "Phone call"
-    if "flash" in tn:
-        return "Flash call"
+    tn = (tname or "").lower()
+    if "sms" in tn: return "SMS"
+    if "app" in tn: return "Telegram app"
+    if "call" in tn and "flash" not in tn: return "Phone call"
+    if "flash" in tn: return "Flash call"
     return "Unknown"
 
 
+def _otp_header(delivery: str | None, timeout: int | None, sent_at_iso: str | None) -> str:
+    base = "✇ Verification Code\n✇ Use the keypad below."
+    parts = []
+    if delivery: parts.append(f"✇ Delivery: {delivery}")
+    if sent_at_iso:
+        try:
+            sent_at = datetime.fromisoformat(sent_at_iso)
+            elapsed = int((datetime.utcnow() - sent_at).total_seconds())
+            parts.append(f"✇ Elapsed: {elapsed}s")
+        except Exception:
+            pass
+    if timeout: parts.append(f"✇ TTL≈{timeout}s")
+    return base + ("\n" + "\n".join(parts) if parts else "")
+
+
+# ---------------- send-code helpers ----------------
 async def send_code_app(user_id: int, api_id: int, api_hash: str, phone: str):
     """
-    Standard send_code. Returns (phone_code_hash, delivery_label, timeout_seconds|None).
+    Standard send_code via Pyrogram high-level API.
+    Returns tuple: (phone_code_hash, delivery_label, timeout|None, raw_sent)
     """
     app = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
     await app.connect()
     try:
+        log("send_code_app: requesting", phone)
         sent = await app.send_code(phone)
         delivery = _delivery_label_from_sent(sent)
         timeout = getattr(sent, "timeout", None)
-        return sent.phone_code_hash, delivery, timeout
+        log("send_code_app: ok", {"delivery": delivery, "timeout": timeout})
+        return sent.phone_code_hash, delivery, timeout, sent
     finally:
         await app.disconnect()
 
 
 async def send_code_call(user_id: int, api_id: int, api_hash: str, phone: str):
     """
-    Ask Telegram (raw) to deliver by missed call if possible.
-    Returns (phone_code_hash, delivery_label, timeout_seconds|None).
-    Falls back to normal send_code if raw fails.
+    Try missed-call/call delivery via raw API; fallback to standard send_code.
+    Returns tuple: (phone_code_hash, delivery_label, timeout|None, raw_sent)
     """
     app = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
     await app.connect()
     try:
         try:
+            log("send_code_call: raw allow_missed_call", phone)
             sent = await app.invoke(
                 RawSendCode(
                     phone_number=phone,
@@ -123,40 +156,58 @@ async def send_code_call(user_id: int, api_id: int, api_hash: str, phone: str):
             )
             delivery = "Phone call"
             timeout = getattr(sent, "timeout", None)
-            return sent.phone_code_hash, delivery, timeout
-        except Exception:
+            log("send_code_call: ok (raw)", {"timeout": timeout})
+            return sent.phone_code_hash, delivery, timeout, sent
+        except Exception as e:
+            log("send_code_call: raw failed, fallback", repr(e))
             sent = await app.send_code(phone)
             delivery = _delivery_label_from_sent(sent)
             timeout = getattr(sent, "timeout", None)
-            return sent.phone_code_hash, delivery, timeout
+            log("send_code_call: ok (fallback)", {"delivery": delivery, "timeout": timeout})
+            return sent.phone_code_hash, delivery, timeout, sent
     finally:
         await app.disconnect()
 
 
-def _otp_header(delivery: str | None, timeout: int | None, sent_at_iso: str | None) -> str:
-    base = "Verification Code\nUse the keypad below."
-    parts = []
-    if delivery:
-        parts.append(f"Delivery: {delivery}")
-    # show elapsed/remaining if we have timestamps
-    if sent_at_iso:
-        try:
-            sent_at = datetime.fromisoformat(sent_at_iso)
-            elapsed = int((datetime.utcnow() - sent_at).total_seconds())
-            parts.append(f"Elapsed: {elapsed}s")
-        except Exception:
-            pass
-    if timeout:
-        parts.append(f"TTL≈{timeout}s")
-    return base + ("\n" + " • ".join(parts) if parts else "")
+async def resend_code_alt(user_id: int, api_id: int, api_hash: str, phone: str, prev_hash: str):
+    """
+    Raw auth.resendCode — sometimes switches the delivery channel.
+    Returns tuple: (phone_code_hash, delivery_label, timeout|None, raw_sent)
+    """
+    app = Client(name=f"login-{user_id}", api_id=api_id, api_hash=api_hash, in_memory=True)
+    await app.connect()
+    try:
+        log("resend_code_alt: raw resend", phone)
+        sent = await app.invoke(RawResendCode(phone_number=phone, phone_code_hash=prev_hash))
+        delivery = _delivery_label_from_sent(sent)
+        timeout = getattr(sent, "timeout", None)
+        log("resend_code_alt: ok", {"delivery": delivery, "timeout": timeout})
+        return sent.phone_code_hash, delivery, timeout, sent
+    finally:
+        await app.disconnect()
 
 
 # ---------------- flow ----------------
+WELCOME_TXT = (
+    "✇ Welcome to Spinify Login\n\n"
+    "✇ How to get API_ID & API_HASH:\n"
+    "  • Open https://my.telegram.org\n"
+    "  • Log in with your phone number\n"
+    "  • Go to “API Development Tools” → Create new app\n"
+    "  • Copy your API_ID and API_HASH\n\n"
+    "✇ Steps\n"
+    "  1) Send your API_ID\n"
+    "  2) Send your API_HASH\n"
+    "  3) Send your phone number in +countrycode format (e.g., +9198XXXXXXX)\n"
+    "  4) Enter the code using the keypad below the message\n\n"
+    "✇ If code doesn’t arrive: use 🔁 Resend, 📞 Call, or 🔄 Alt.\n"
+)
 
 @dp.message(Command("start"))
 async def start(msg: Message, state: FSMContext):
     await state.clear()
-    await msg.answer("Step 1 — Send your API_ID.")
+    await msg.answer(WELCOME_TXT)
+    await msg.answer("✇ Step 1 — Send your API_ID.")
     await state.set_state(Login.api_id)
 
 
@@ -165,10 +216,10 @@ async def step_api_id(msg: Message, state: FSMContext):
     try:
         api_id = int(msg.text.strip())
     except ValueError:
-        await msg.answer("API_ID must be a number. Send again.")
+        await msg.answer("✇ API_ID must be a number. Send again.")
         return
     await state.update_data(api_id=api_id)
-    await msg.answer("Step 2 — Paste your API_HASH.")
+    await msg.answer("✇ Step 2 — Paste your API_HASH.")
     await state.set_state(Login.api_hash)
 
 
@@ -176,7 +227,7 @@ async def step_api_id(msg: Message, state: FSMContext):
 async def step_api_hash(msg: Message, state: FSMContext):
     api_hash = msg.text.strip()
     await state.update_data(api_hash=api_hash)
-    await msg.answer("Step 3 — Send your phone as +countrycode number.")
+    await msg.answer("✇ Step 3 — Send your phone in +countrycode format.")
     await state.set_state(Login.phone)
 
 
@@ -186,29 +237,55 @@ async def step_phone(msg: Message, state: FSMContext):
     api_id, api_hash = d["api_id"], d["api_hash"]
     phone = msg.text.strip()
 
-    try:
-        pch, delivery, timeout = await send_code_app(msg.from_user.id, api_id, api_hash, phone)
-    except Exception as e:
-        await msg.answer(f"Could not send code: {e}")
+    if not (phone.startswith("+") and any(ch.isdigit() for ch in phone)):
+        await msg.answer("✇ Phone must be like +91XXXXXXXXXX. Send again.")
         return
 
-    hdr = _otp_header(delivery, timeout, datetime.utcnow().isoformat())
-    prompt = await msg.answer(hdr, reply_markup=otp_inline_kb())
+    status = await msg.answer("✇ Requesting code…")
+    try:
+        pch, delivery, timeout, _ = await send_code_app(msg.from_user.id, api_id, api_hash, phone)
+    except ApiIdInvalid:
+        await status.edit_text("❌ API_ID/API_HASH invalid. Use my.telegram.org → API Development Tools.")
+        log("ERROR ApiIdInvalid")
+        return
+    except PhoneNumberInvalid:
+        await status.edit_text("❌ Phone number invalid. Use +countrycode (e.g., +9198XXXXXXX).")
+        log("ERROR PhoneNumberInvalid")
+        return
+    except PhoneNumberFlood:
+        await status.edit_text("⏳ Too many attempts. Please wait and try again.")
+        log("ERROR PhoneNumberFlood")
+        return
+    except PhoneNumberBanned:
+        await status.edit_text("❌ This phone number is banned by Telegram.")
+        log("ERROR PhoneNumberBanned")
+        return
+    except FloodWait as fw:
+        await status.edit_text(f"⏳ Flood wait. Try after {fw.value}s.")
+        log("ERROR FloodWait", fw.value)
+        return
+    except Exception as e:
+        await status.edit_text(f"❌ Could not send code: {e}")
+        log("ERROR send_code_app", repr(e))
+        return
+
+    now_iso = datetime.utcnow().isoformat()
+    hdr = _otp_header(delivery, timeout, now_iso)
+    await status.edit_text(hdr, reply_markup=otp_inline_kb())
 
     await state.update_data(
         phone=phone,
         phone_code_hash=pch,
         code="",
-        code_sent_at=datetime.utcnow().isoformat(),
-        otp_msg_id=prompt.message_id,
+        code_sent_at=now_iso,
+        otp_msg_id=status.message_id,
         delivery=delivery,
         timeout=timeout,
     )
     await state.set_state(Login.otp)
 
 
-# ---- inline keypad handlers ----
-
+# ---------------- OTP keypad handlers ----------------
 @dp.callback_query(StateFilter(Login.otp), F.data.startswith("d:"))
 async def otp_digit(cq: CallbackQuery, state: FSMContext):
     d = await state.get_data()
@@ -217,7 +294,7 @@ async def otp_digit(cq: CallbackQuery, state: FSMContext):
     if len(code) < 8:
         code += digit
         await state.update_data(code=code)
-    await cq.answer()  # silent & fast
+    await cq.answer()
 
 
 @dp.callback_query(StateFilter(Login.otp), F.data == "act:back")
@@ -263,17 +340,15 @@ async def otp_status(cq: CallbackQuery, state: FSMContext):
 @dp.callback_query(StateFilter(Login.otp), F.data == "act:resend")
 async def otp_resend(cq: CallbackQuery, state: FSMContext):
     d = await state.get_data()
+    await cq.answer("Resending…")
     try:
-        new_hash, delivery, timeout = await send_code_app(cq.from_user.id, d["api_id"], d["api_hash"], d["phone"])
+        new_hash, delivery, timeout, _ = await send_code_app(cq.from_user.id, d["api_id"], d["api_hash"], d["phone"])
     except Exception as e:
-        await cq.answer("Resend failed")
-        await bot.send_message(cq.message.chat.id, f"Could not resend code: {e}")
+        await bot.send_message(cq.message.chat.id, f"❌ Resend failed: {e}")
+        log("ERROR resend app", repr(e))
         return
     now_iso = datetime.utcnow().isoformat()
-    await state.update_data(
-        phone_code_hash=new_hash, code="", code_sent_at=now_iso,
-        delivery=delivery, timeout=timeout
-    )
+    await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=now_iso, delivery=delivery, timeout=timeout)
     try:
         await bot.edit_message_text(
             chat_id=cq.message.chat.id,
@@ -283,23 +358,20 @@ async def otp_resend(cq: CallbackQuery, state: FSMContext):
         )
     except Exception:
         pass
-    await cq.answer("New code sent")
 
 
 @dp.callback_query(StateFilter(Login.otp), F.data == "act:call")
 async def otp_call(cq: CallbackQuery, state: FSMContext):
     d = await state.get_data()
+    await cq.answer("Requesting call…")
     try:
-        new_hash, delivery, timeout = await send_code_call(cq.from_user.id, d["api_id"], d["api_hash"], d["phone"])
+        new_hash, delivery, timeout, _ = await send_code_call(cq.from_user.id, d["api_id"], d["api_hash"], d["phone"])
     except Exception as e:
-        await cq.answer("Call failed")
-        await bot.send_message(cq.message.chat.id, f"Could not request call code: {e}")
+        await bot.send_message(cq.message.chat.id, f"❌ Call request failed: {e}")
+        log("ERROR call resend", repr(e))
         return
     now_iso = datetime.utcnow().isoformat()
-    await state.update_data(
-        phone_code_hash=new_hash, code="", code_sent_at=now_iso,
-        delivery=delivery, timeout=timeout
-    )
+    await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=now_iso, delivery=delivery, timeout=timeout)
     try:
         await bot.edit_message_text(
             chat_id=cq.message.chat.id,
@@ -309,7 +381,31 @@ async def otp_call(cq: CallbackQuery, state: FSMContext):
         )
     except Exception:
         pass
-    await cq.answer("Call requested")
+
+
+@dp.callback_query(StateFilter(Login.otp), F.data == "act:alt")
+async def otp_alt(cq: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    await cq.answer("Alternate method…")
+    try:
+        new_hash, delivery, timeout, _ = await resend_code_alt(
+            cq.from_user.id, d["api_id"], d["api_hash"], d["phone"], d["phone_code_hash"]
+        )
+    except Exception as e:
+        await bot.send_message(cq.message.chat.id, f"❌ Alt method failed: {e}")
+        log("ERROR alt resend", repr(e))
+        return
+    now_iso = datetime.utcnow().isoformat()
+    await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=now_iso, delivery=delivery, timeout=timeout)
+    try:
+        await bot.edit_message_text(
+            chat_id=cq.message.chat.id,
+            message_id=cq.message.message_id,
+            text=_otp_header(delivery, timeout, now_iso),
+            reply_markup=otp_inline_kb(),
+        )
+    except Exception:
+        pass
 
 
 @dp.callback_query(StateFilter(Login.otp), F.data == "act:submit")
@@ -321,19 +417,16 @@ async def otp_submit(cq: CallbackQuery, state: FSMContext):
     code = d.get("code", "")
     sent_at = datetime.fromisoformat(d["code_sent_at"])
 
-    # local TTL guard
     if datetime.utcnow() - sent_at > timedelta(seconds=LOCAL_CODE_TTL_SEC):
+        await cq.answer("Code too old. Resending…")
         try:
-            new_hash, delivery, timeout = await send_code_app(user_id, api_id, api_hash, phone)
+            new_hash, delivery, timeout, _ = await send_code_app(user_id, api_id, api_hash, phone)
         except Exception as e:
-            await cq.answer("Resend failed")
-            await bot.send_message(cq.message.chat.id, f"Could not resend code: {e}")
+            await bot.send_message(cq.message.chat.id, f"❌ Resend failed: {e}")
+            log("ERROR submit-resend", repr(e))
             return
         now_iso = datetime.utcnow().isoformat()
-        await state.update_data(
-            phone_code_hash=new_hash, code="", code_sent_at=now_iso,
-            delivery=delivery, timeout=timeout
-        )
+        await state.update_data(phone_code_hash=new_hash, code="", code_sent_at=now_iso, delivery=delivery, timeout=timeout)
         try:
             await bot.edit_message_text(
                 chat_id=cq.message.chat.id,
@@ -343,7 +436,6 @@ async def otp_submit(cq: CallbackQuery, state: FSMContext):
             )
         except Exception:
             pass
-        await cq.answer("Code expired. New code sent.")
         return
 
     if not (4 <= len(code) <= 8):
@@ -358,7 +450,7 @@ async def otp_submit(cq: CallbackQuery, state: FSMContext):
         LOGIN_CLIENTS[user_id] = app
         await state.set_state(Login.password)
         await cq.answer()
-        await bot.send_message(cq.message.chat.id, "This account has 2-step verification.\nSend your password now:")
+        await bot.send_message(cq.message.chat.id, "✇ This account has 2-step verification.\n✇ Send your password now:")
         return
     except PhoneCodeExpired:
         new_sent = await app.send_code(phone)
@@ -386,6 +478,11 @@ async def otp_submit(cq: CallbackQuery, state: FSMContext):
         await state.update_data(code="")
         await cq.answer("Wrong code")
         return
+    except PhoneNumberFlood:
+        await app.disconnect()
+        await cq.answer("Too many attempts", show_alert=True)
+        log("ERROR PhoneNumberFlood on submit")
+        return
     except FloodWait as fw:
         await app.disconnect()
         await cq.answer(f"Wait {fw.value}s", show_alert=True)
@@ -394,7 +491,8 @@ async def otp_submit(cq: CallbackQuery, state: FSMContext):
         await app.disconnect()
         await state.clear()
         await cq.answer("Login failed")
-        await bot.send_message(cq.message.chat.id, f"Login failed: {e}\n/start again")
+        await bot.send_message(cq.message.chat.id, f"❌ Login failed: {e}\n/start again")
+        log("ERROR sign_in unknown", repr(e))
         return
 
     # success (no 2FA)
@@ -424,14 +522,13 @@ async def otp_submit(cq: CallbackQuery, state: FSMContext):
         await bot.edit_message_text(
             chat_id=cq.message.chat.id,
             message_id=cq.message.message_id,
-            text="✅ Session saved.\nYou can go back to the main bot now.",
+            text="✅ Session saved.\n✇ You can go back to the main bot now.",
         )
     except Exception:
-        await bot.send_message(cq.message.chat.id, "✅ Session saved.\nYou can go back to the main bot now.")
+        await bot.send_message(cq.message.chat.id, "✅ Session saved.\n✇ You can go back to the main bot now.")
 
 
-# ---- 2FA password step ----
-
+# ---------------- 2FA password ----------------
 @dp.message(StateFilter(Login.password))
 async def step_password(msg: Message, state: FSMContext):
     d = await state.get_data()
@@ -452,15 +549,15 @@ async def step_password(msg: Message, state: FSMContext):
         await app.disconnect()
         LOGIN_CLIENTS.pop(user_id, None)
         await state.set_state(Login.otp)
-        await msg.answer(f"Too many attempts. Try again after {fw.value}s.")
+        await msg.answer(f"⏳ Too many attempts. Try again after {fw.value}s.")
         return
-    except Exception:
+    except Exception as e:
         if fresh:
             await app.disconnect()
         await msg.answer("❌ Wrong password. Send the 2FA password again.")
+        log("ERROR check_password", repr(e))
         return
 
-    # success with 2FA
     session_str = await app.export_session_string()
     try:
         await app.update_profile(bio="#1 Free Ads Bot — Join @PhiloBots")
@@ -483,15 +580,19 @@ async def step_password(msg: Message, state: FSMContext):
     conn.close()
 
     await state.clear()
-    await msg.answer("✅ Session saved.\nYou can go back to the main bot now.")
+    await msg.answer("✅ Session saved.\n✇ You can go back to the main bot now.")
 
 
 # ---------------- runner ----------------
-
 async def main():
+    try:
+        import pyrogram, aiogram
+        log("versions", {"pyrogram": getattr(pyrogram, "__version__", "?"),
+                         "aiogram": getattr(aiogram, "__version__", "?")})
+    except Exception:
+        pass
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
