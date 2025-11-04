@@ -1,7 +1,4 @@
-# worker_forward.py — forwards the saved ad to saved groups on an interval
-# Uses tables: user_sessions(user_id, api_id, api_hash, session_string)
-#              user_settings(user_id, interval_minutes, ad_text, groups_text, updated_at)
-
+# worker_forward.py — forwards saved ad to saved groups on interval
 import asyncio
 import logging
 from datetime import datetime
@@ -15,11 +12,9 @@ from core.db import get_conn, init_db
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("worker")
 
-# user_id -> asyncio.Task
 FORWARD_TASKS: Dict[int, asyncio.Task] = {}
 
 def ensure_tables():
-    """Make sure settings table exists (login bot creates user_sessions)."""
     init_db()
     conn = get_conn()
     conn.execute("""
@@ -29,16 +24,10 @@ def ensure_tables():
       ad_text TEXT DEFAULT '',
       groups_text TEXT DEFAULT '',
       updated_at TEXT
-    )
-    """)
-    conn.commit()
-    conn.close()
+    )""")
+    conn.commit(); conn.close()
 
 def load_accounts() -> List[Tuple[int, int, str, str, int, str, str]]:
-    """
-    Returns list of rows:
-      (user_id, api_id, api_hash, session_string, interval_minutes, ad_text, groups_text)
-    """
     conn = get_conn()
     cur = conn.execute("""
       SELECT s.user_id, s.api_id, s.api_hash, s.session_string,
@@ -53,7 +42,6 @@ def load_accounts() -> List[Tuple[int, int, str, str, int, str, str]]:
     return rows
 
 def reload_settings(user_id: int):
-    """Fetch current settings for a user."""
     conn = get_conn()
     row = conn.execute("""
       SELECT COALESCE(interval_minutes, 60), COALESCE(ad_text, ''), COALESCE(groups_text, '')
@@ -65,35 +53,25 @@ def reload_settings(user_id: int):
     return int(row[0]), str(row[1]), str(row[2])
 
 def parse_groups(groups_text: str) -> List[str]:
-    """
-    Normalize group links/usernames:
-      - https://t.me/abc -> 'abc'
-      - @abc -> 'abc'
-      - abc  -> 'abc'
-    Only t.me usernames/supergroups with public @ are supported.
-    """
     out = []
     for raw in (groups_text or "").splitlines():
         g = raw.strip()
-        if not g:
-            continue
+        if not g: continue
         if g.startswith("https://t.me/"):
             g = g.split("https://t.me/", 1)[1].strip("/")
-        if g.startswith("@"):
-            g = g[1:]
+        if g.startswith("@"): g = g[1:]
         if g and g not in out:
             out.append(g)
-        if len(out) == 5:
-            break
+        if len(out) == 5: break
     return out
 
-async def send_once(app: Client, groups: List[str], text: str) -> Tuple[int, int]:
+async def send_once(app: Client, groups: List[str], text: str):
     ok, fail = 0, 0
     for g in groups:
         try:
             await app.send_message(g, text)
             ok += 1
-            await asyncio.sleep(0.5)  # be polite
+            await asyncio.sleep(0.5)
         except FloodWait as fw:
             log.warning(f"[{app.name}] FloodWait {fw.value}s on @{g}")
             await asyncio.sleep(fw.value + 1)
@@ -109,13 +87,6 @@ async def send_once(app: Client, groups: List[str], text: str) -> Tuple[int, int
     return ok, fail
 
 async def forward_loop(user_id: int, api_id: int, api_hash: str, session_string: str):
-    """
-    Per-user loop:
-      - start Pyrogram client from session_string
-      - read settings every cycle
-      - if ad/groups missing: wait briefly and retry
-      - otherwise send to each group, then sleep interval minutes
-    """
     app = Client(name=f"user-{user_id}", api_id=api_id, api_hash=api_hash, session_string=session_string)
     try:
         await app.start()
@@ -128,15 +99,10 @@ async def forward_loop(user_id: int, api_id: int, api_hash: str, session_string:
         while True:
             interval, ad_text, groups_text = reload_settings(user_id)
             groups = parse_groups(groups_text)
-
             if not ad_text:
-                log.info(f"[u{user_id}] no ad set — sleeping 15s")
-                await asyncio.sleep(15)
-                continue
+                log.info(f"[u{user_id}] no ad set — sleeping 15s"); await asyncio.sleep(15); continue
             if not groups:
-                log.info(f"[u{user_id}] no groups set — sleeping 15s")
-                await asyncio.sleep(15)
-                continue
+                log.info(f"[u{user_id}] no groups set — sleeping 15s"); await asyncio.sleep(15); continue
 
             ok, fail = await send_once(app, groups, ad_text)
             now = datetime.utcnow().isoformat()
@@ -147,10 +113,8 @@ async def forward_loop(user_id: int, api_id: int, api_hash: str, session_string:
     except Exception as e:
         log.error(f"[u{user_id}] loop error: {e}")
     finally:
-        try:
-            await app.stop()
-        except Exception:
-            pass
+        try: await app.stop()
+        except Exception: pass
         log.info(f"[u{user_id}] client stopped")
 
 async def loop_worker():
@@ -159,29 +123,24 @@ async def loop_worker():
     try:
         while True:
             rows = load_accounts()
-            # start tasks for new users, stop for removed
-            active_ids = set()
+            active = set()
             for (user_id, api_id, api_hash, session_string, *_rest) in rows:
-                active_ids.add(user_id)
+                active.add(user_id)
                 if user_id not in FORWARD_TASKS or FORWARD_TASKS[user_id].done():
                     log.info(f"[worker] starting task for user {user_id}")
                     FORWARD_TASKS[user_id] = asyncio.create_task(
                         forward_loop(user_id, api_id, api_hash, session_string)
                     )
-
-            # cancel tasks for users whose session is gone
             for uid in list(FORWARD_TASKS.keys()):
-                if uid not in active_ids:
+                if uid not in active:
                     t = FORWARD_TASKS.pop(uid)
                     log.info(f"[worker] stopping task for user {uid} (session removed)")
                     t.cancel()
-
-            await asyncio.sleep(10)  # poll DB every 10s
+            await asyncio.sleep(10)
     except asyncio.CancelledError:
         pass
     finally:
-        for t in FORWARD_TASKS.values():
-            t.cancel()
+        for t in FORWARD_TASKS.values(): t.cancel()
         await asyncio.gather(*FORWARD_TASKS.values(), return_exceptions=True)
         log.info("[worker] stopped")
 
