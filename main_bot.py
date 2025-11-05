@@ -1,12 +1,15 @@
-# main_bot.py — Compact-first responsive inline UI (aiogram 3.x)
+# main_bot.py — Compact-first inline UI (aiogram 3.x), no WebApp
 # Features:
 # - Interval presets: 30/45/60
 # - /stats (owner-only), /top [N] (anyone)
 # - Set Ad, Add/Clear Groups, View Groups (pagination), Refresh
-# - Layout preference per-user; default locked to COMPACT unless SHOW_LAYOUT_TOGGLE=1
+# - Layout default = COMPACT; toggle can be hidden via env
 
-import asyncio, os, json, math
+import os, json, math, asyncio
+from pathlib import Path
 from typing import List, Tuple
+
+from dotenv import load_dotenv, find_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -14,7 +17,6 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from dotenv import load_dotenv
 
 from core.db import (
     init_db, upsert_user, set_ad, get_ad, set_interval, get_interval,
@@ -22,19 +24,24 @@ from core.db import (
     users_count, sessions_count, get_total_sent_ok, top_users, get_conn
 )
 
-load_dotenv()
+# ---------- strict env loading ----------
+_env_file = find_dotenv(filename=".env", usecwd=True) or str(Path(__file__).with_name(".env"))
+load_dotenv(_env_file, override=True)
 
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN") or os.getenv("ADS_BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("ADS_BOT_TOKEN", "")).strip()
+if (":" not in TOKEN) or (len(TOKEN) < 30):
+    raise RuntimeError("MAIN_BOT_TOKEN missing/malformed. Get a fresh token from @BotFather (/token).")
+
+try:
+    OWNER_ID = int((os.getenv("OWNER_ID", "0") or "0").strip())
+except ValueError:
+    OWNER_ID = 0
 
 # UI prefs
 GLOBAL_DEFAULT_LAYOUT = os.getenv("DEFAULT_LAYOUT", "compact")  # compact|cozy|spacious
-SHOW_LAYOUT_TOGGLE = os.getenv("SHOW_LAYOUT_TOGGLE", "0") == "1"
+SHOW_LAYOUT_TOGGLE = os.getenv("SHOW_LAYOUT_TOGGLE", "0").strip() == "1"
 
-if not MAIN_BOT_TOKEN:
-    raise RuntimeError("MAIN_BOT_TOKEN (or ADS_BOT_TOKEN) missing in .env")
-
-bot = Bot(MAIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp  = Dispatcher()
 
 VALID_INTERVALS = (30, 45, 60)
@@ -95,18 +102,16 @@ def chunk_buttons(btns: List[InlineKeyboardButton], cols: int) -> List[List[Inli
 def home_kb(user_id: int) -> InlineKeyboardMarkup:
     layout = get_pref(user_id, "layout", GLOBAL_DEFAULT_LAYOUT)
     cols = layout_cols(layout)
-
     btns = [
-        InlineKeyboardButton(text="📝 Set Ad", callback_data="set_ad"),
-        InlineKeyboardButton(text="👥 Add Groups", callback_data="add_groups"),
-        InlineKeyboardButton(text="📜 View Groups", callback_data="groups:list:1"),
-        InlineKeyboardButton(text="⏱ Interval", callback_data="interval"),
+        InlineKeyboardButton(text="📝 Set Ad",       callback_data="set_ad"),
+        InlineKeyboardButton(text="👥 Add Groups",   callback_data="add_groups"),
+        InlineKeyboardButton(text="📜 View Groups",  callback_data="groups:list:1"),
+        InlineKeyboardButton(text="⏱ Interval",      callback_data="interval"),
         InlineKeyboardButton(text="🧹 Clear Groups", callback_data="clear_groups"),
-        InlineKeyboardButton(text="🔁 Refresh", callback_data="refresh"),
+        InlineKeyboardButton(text="🔁 Refresh",      callback_data="refresh"),
     ]
     if SHOW_LAYOUT_TOGGLE:
         btns.append(InlineKeyboardButton(text=f"🧩 Layout ({layout.title()})", callback_data="layout"))
-
     rows = chunk_buttons(btns, cols)
     rows.append([InlineKeyboardButton(text="📊 Owner Stats", callback_data="owner_stats")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -132,7 +137,6 @@ def groups_page_text(user_id: int, page: int, per_page: int = 8) -> Tuple[str, i
     total = len(gs)
     pages = max(1, math.ceil(total / per_page))
     page = max(1, min(page, pages))
-
     start = (page - 1) * per_page
     end = min(start + per_page, total)
     show = gs[start:end]
@@ -148,7 +152,6 @@ def groups_page_text(user_id: int, page: int, per_page: int = 8) -> Tuple[str, i
             lines.append(f"{i:>3}. <code>{g}</code>")
     lines.append("")
     lines.append("Tip: Use <b>🧹 Clear Groups</b> to remove all.")
-
     return "\n".join(lines), pages
 
 def groups_page_kb(page: int, pages: int) -> InlineKeyboardMarkup:
@@ -189,7 +192,8 @@ async def send_home(msg: Message | CallbackQuery):
 # ---------- commands ----------
 @dp.message(Command("start"))
 async def start_cmd(m: Message, state: FSMContext):
-    await state.clear(); await send_home(m)
+    await state.clear()
+    await send_home(m)
 
 @dp.message(Command("stats"))
 async def cmd_stats(m: Message):
@@ -212,7 +216,8 @@ async def cmd_top(m: Message, command: CommandObject):
     except:
         n = 10
     rows = top_users(limit=n)
-    if not rows: return await m.answer("No users yet.")
+    if not rows:
+        return await m.answer("No users yet.")
     lines = [f"<b>Top users (by messages sent) — top {n}</b>"]
     for i, r in enumerate(rows, start=1):
         lines.append(
@@ -269,9 +274,12 @@ async def cb_interval(c: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("interval:"))
 async def cb_interval_set(c: CallbackQuery, state: FSMContext):
     _, minutes = c.data.split(":", 1)
-    try: m = int(minutes)
-    except: m = 30
-    if m not in VALID_INTERVALS: m = 30
+    try:
+        m = int(minutes)
+    except:
+        m = 30
+    if m not in VALID_INTERVALS:
+        m = 30
     set_interval(c.from_user.id, m)
     await c.answer(f"Interval set to {m}m")
     await cb_interval(c, state)
