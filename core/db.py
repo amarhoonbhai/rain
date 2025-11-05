@@ -4,6 +4,7 @@
 # - groups: stored in settings as JSON, capped to 5 per user
 # - per-user ad + interval
 # - global night mode
+# - premium name-lock (for profile_enforcer)
 # - wide compatibility aliases for older code
 
 from __future__ import annotations
@@ -254,7 +255,6 @@ def get_total_sent_ok() -> int:
 def top_users(limit: int = 10) -> List[sqlite3.Row]:
     limit = max(1, min(50, int(limit)))
     conn = get_conn()
-    # emulate NULLS LAST for SQLite
     rows = conn.execute("""
         SELECT u.user_id, u.username, s.sent_ok, s.last_sent_at
         FROM stats_user s
@@ -272,6 +272,49 @@ def night_enabled() -> bool:
 
 def set_night_enabled(on: bool) -> None:
     _set_setting("global:night", "1" if on else "0")
+
+# -------------------- premium / name-lock helpers --------------------
+def set_name_lock(user_id: int, enabled: bool, name: str | None = None, expires_at: str | None = None) -> None:
+    """
+    enabled: True/False
+    name: desired first_name to enforce (optional; keep previous if None)
+    expires_at: ISO datetime (UTC or local); None = no expiry
+    """
+    key = f"name_lock:{user_id}"
+    cfg = _get_setting(key, {}) or {}
+    cfg["enabled"] = bool(enabled)
+    if name is not None:
+        cfg["name"] = name
+    cfg["expires_at"] = expires_at
+    _set_setting(key, cfg)
+
+def get_name_lock(user_id: int):
+    """Returns dict or None: {'enabled': bool, 'name': str, 'expires_at': str|None}"""
+    v = _get_setting(f"name_lock:{user_id}", None)
+    return v if isinstance(v, dict) else None
+
+def name_lock_targets():
+    """
+    Yields rows for all users with enabled name-lock.
+    Returns list of dicts: {'user_id': int, 'cfg': dict}
+    """
+    conn = get_conn()
+    rows = conn.execute("SELECT key, val FROM settings WHERE key LIKE 'name_lock:%'").fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            cfg = json.loads(r["val"]) if isinstance(r["val"], str) else r["val"]
+        except Exception:
+            cfg = None
+        if not cfg or not isinstance(cfg, dict) or not cfg.get("enabled"):
+            continue
+        try:
+            uid = int(r["key"].split(":", 1)[1])
+        except Exception:
+            continue
+        out.append({"user_id": uid, "cfg": cfg})
+    return out
 
 # -------------------- compatibility aliases (old names -> new) --------------------
 # users
@@ -345,4 +388,3 @@ def enable_night_mode() -> None:
 
 def disable_night_mode() -> None:
     return set_night_enabled(False)
-    
