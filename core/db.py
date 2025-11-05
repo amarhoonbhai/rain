@@ -1,16 +1,19 @@
-# core/db.py — SQLite helpers for Spinify/Ads bot (Py 3.12+)
+# core/db.py — SQLite helpers for Spinify/Ads bot (Python 3.12+)
 # - users, settings (KV), stats_user
 # - user_sessions: multi-slot (up to 3 accounts/user)
 # - groups: stored in settings as JSON, capped to 5 per user
-# - per-user ad + interval
+# - per-user ad + interval (30/45/60)
 # - global night mode
 # - premium name-lock (for profile_enforcer)
-# - wide compatibility aliases for older code
+# - "next run" scheduler keys for worker
+# - gate channels helpers
+# - wide compatibility aliases (old names -> new)
 
 from __future__ import annotations
 import os, json, sqlite3
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Tuple, Optional
+from datetime import datetime
 
 DB_PATH = os.getenv("DB_PATH") or str(Path(__file__).resolve().parent.parent / "data.db")
 
@@ -108,6 +111,15 @@ def _del_setting(key: str) -> None:
     conn.execute("DELETE FROM settings WHERE key=?", (key,))
     conn.commit(); conn.close()
 
+# Public wrappers (some code imports these names)
+def set_setting(key: str, val: Any) -> None: _set_setting(key, val)
+def get_setting(key: str, default: Any = None) -> Any: return _get_setting(key, default)
+def del_setting(key: str) -> None: _del_setting(key)
+# extra synonyms
+def set_config(key: str, val: Any) -> None: _set_setting(key, val)
+def get_config(key: str, default: Any = None) -> Any: return _get_setting(key, default)
+def del_config(key: str) -> None: _del_setting(key)
+
 # -------------------- users --------------------
 def ensure_user(user_id: int, username: str | None = None) -> None:
     conn = get_conn()
@@ -130,14 +142,15 @@ def users_count() -> int:
 def set_ad(user_id: int, ad_text: str) -> None:
     _set_setting(f"ad:{user_id}", ad_text)
 
-def get_ad(user_id: int) -> str | None:
-    return _get_setting(f"ad:{user_id}", None)
+def get_ad(user_id: int) -> Optional[str]:
+    v = _get_setting(f"ad:{user_id}", None)
+    return v if (v is None or isinstance(v, str)) else str(v)
 
 # -------------------- interval --------------------
 def set_interval(user_id: int, minutes: int) -> None:
     _set_setting(f"interval:{user_id}", int(minutes))
 
-def get_interval(user_id: int) -> int | None:
+def get_interval(user_id: int) -> Optional[int]:
     v = _get_setting(f"interval:{user_id}", None)
     try:
         return int(v) if v is not None else None
@@ -145,6 +158,8 @@ def get_interval(user_id: int) -> int | None:
         return None
 
 # -------------------- groups (cap = 5) --------------------
+def groups_cap() -> int: return 5
+
 def _norm_group(g: str) -> str:
     g = (g or "").strip()
     if not g: return ""
@@ -161,7 +176,7 @@ def add_groups(user_id: int, group_ids: List[str]) -> int:
         current = set(cur if isinstance(cur, list) else [])
     except Exception:
         current = set()
-    allowed = 5 - len(current)
+    allowed = groups_cap() - len(current)
     if allowed <= 0:
         return 0
     normalized = []
@@ -176,6 +191,9 @@ def add_groups(user_id: int, group_ids: List[str]) -> int:
     _set_setting(key, sorted(list(current)))
     return len(to_add)
 
+def add_group(user_id: int, group: str) -> int:
+    return add_groups(user_id, [group])
+
 def list_groups(user_id: int) -> List[str]:
     v = _get_setting(f"groups:{user_id}", [])
     return list(v if isinstance(v, list) else [])
@@ -183,7 +201,12 @@ def list_groups(user_id: int) -> List[str]:
 def clear_groups(user_id: int) -> None:
     _set_setting(f"groups:{user_id}", [])
 
+def get_groups(user_id: int) -> List[str]:  # legacy name
+    return list_groups(user_id)
+
 # -------------------- sessions (multi-slot up to 3) --------------------
+def sessions_max_slots() -> int: return 3
+
 def sessions_list(user_id: int) -> List[sqlite3.Row]:
     conn = get_conn()
     rows = conn.execute(
@@ -238,6 +261,12 @@ def sessions_upsert_slot(user_id: int, slot: int, api_id: int, api_hash: str, se
 def sessions_delete(user_id: int, slot: int) -> int:
     conn = get_conn()
     cur = conn.execute("DELETE FROM user_sessions WHERE user_id=? AND slot=?", (user_id, slot))
+    conn.commit(); conn.close()
+    return cur.rowcount
+
+def sessions_delete_all(user_id: int) -> int:
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM user_sessions WHERE user_id=?", (user_id,))
     conn.commit(); conn.close()
     return cur.rowcount
 
@@ -332,9 +361,32 @@ def name_lock_targets():
         out.append({"user_id": uid, "cfg": cfg})
     return out
 
+# -------------------- gate channels helpers --------------------
+def set_gate_channels(ch1: Optional[str], ch2: Optional[str]) -> None:
+    _set_setting("gate:ch1", ch1 or "")
+    _set_setting("gate:ch2", ch2 or "")
+
+def get_gate_channels() -> Tuple[str, str]:
+    ch1 = _get_setting("gate:ch1", "") or ""
+    ch2 = _get_setting("gate:ch2", "") or ""
+    return str(ch1), str(ch2)
+
+# -------------------- per-user next-run scheduler --------------------
+def set_next_time(user_id: int, when_iso: str) -> None:
+    _set_setting(f"next:{user_id}", when_iso)
+
+def get_next_time(user_id: int) -> Optional[datetime]:
+    val = _get_setting(f"next:{user_id}", None)
+    if not val:
+        return None
+    try:
+        return datetime.fromisoformat(val)
+    except Exception:
+        return None
+
 # -------------------- compatibility aliases (old names -> new) --------------------
 # users
-def upsertUser(user_id: int, username: str | None = None):
+def upsertUser(user_id: int, username: str | None = None):  # ultra-legacy
     return ensure_user(user_id, username)
 
 # sessions counters
@@ -360,7 +412,7 @@ def get_user_sessions_strings(user_id: int):
 def get_sessions_strings(user_id: int):
     return sessions_strings(user_id)
 
-# sessions add/delete/upsert-slot
+# sessions add/delete/upsert-slot/misc
 def add_user_session(user_id: int, api_id: int, api_hash: str, session_string: str) -> int:
     return sessions_add(user_id, api_id, api_hash, session_string)
 
@@ -376,12 +428,36 @@ def delete_session_slot(user_id: int, slot: int) -> int:
 def delete_session(user_id: int, slot: int) -> int:
     return sessions_delete(user_id, slot)
 
+def delete_all_sessions(user_id: int) -> int:
+    return sessions_delete_all(user_id)
+
 # stats aliases
 def get_total_messages_forwarded() -> int:
     return get_total_sent_ok()
 
 def top_users_by_sent(limit: int = 10):
     return top_users(limit)
+
+def bump_user_sent(user_id: int, inc: int = 1, last_at_iso: str | None = None) -> None:
+    return bump_sent(user_id, inc, last_at_iso)
+
+# group aliases
+def add_user_group(user_id: int, group: str) -> int:
+    return add_group(user_id, group)
+
+def clear_user_groups(user_id: int) -> None:
+    return clear_groups(user_id)
+
+# setting aliases
+def get_kv(key: str, default: Any = None) -> Any: return _get_setting(key, default)
+def set_kv(key: str, val: Any) -> None: _set_setting(key, val)
+def del_kv(key: str) -> None: _del_setting(key)
+
+# ad/interval aliases
+def set_user_ad(user_id: int, ad_text: str) -> None: set_ad(user_id, ad_text)
+def get_user_ad(user_id: int) -> Optional[str]: return get_ad(user_id)
+def set_interval_minutes(user_id: int, minutes: int) -> None: set_interval(user_id, minutes)
+def get_user_interval(user_id: int) -> Optional[int]: return get_interval(user_id)
 
 # night mode aliases
 def is_night_enabled() -> bool:
@@ -407,3 +483,4 @@ def enable_night_mode() -> None:
 
 def disable_night_mode() -> None:
     return set_night_enabled(False)
+    
