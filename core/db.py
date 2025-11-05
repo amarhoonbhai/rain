@@ -1,10 +1,10 @@
-# core/db.py — SQLite helpers for Spinify/Ads bot (Python 3.12+)
+# core/db.py — SQLite helpers for Spinify/Ads bot (Py 3.12+)
 # - users, settings (KV), stats_user
 # - user_sessions: multi-slot (up to 3 accounts/user)
 # - groups: stored in settings as JSON, capped to 5 per user
 # - per-user ad + interval
 # - global night mode
-# - robust compatibility aliases for older code
+# - wide compatibility aliases for older code
 
 from __future__ import annotations
 import os, json, sqlite3
@@ -55,7 +55,7 @@ def init_db() -> None:
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY(user_id, slot)
     )""")
-    # migrate from legacy single-slot table if any
+    # migrate legacy single-slot table if any
     try:
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(user_sessions)")]
         if "slot" not in cols:
@@ -328,3 +328,21 @@ def is_night_enabled() -> bool:
 def set_night(on: bool) -> None:
     return set_night_enabled(on)
 
+def set_global_night_mode(on: bool) -> None:
+    return set_night_enabled(on)
+
+def get_global_night_mode() -> bool:
+    return night_enabled()
+
+def global_night_enabled() -> bool:
+    return night_enabled()
+
+def is_global_night_mode() -> bool:
+    return night_enabled()
+
+def enable_night_mode() -> None:
+    return set_night_enabled(True)
+
+def disable_night_mode() -> None:
+    return set_night_enabled(False)
+    
