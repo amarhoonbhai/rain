@@ -1,152 +1,209 @@
-# core/db.py — schema & helpers (counters + stats + sessions)
-import sqlite3
-from pathlib import Path
-from typing import Iterable, Optional
+# core/db.py  — SQLite helpers for Spinify bots
+# Tables: users, user_sessions (slots 1..3), user_groups, settings
+# Exposes: init_db(), get_conn(), session & settings helpers used by main/login/worker
 
-_DB_PATH = Path(__file__).resolve().parent.parent / "spinify.db"
+from __future__ import annotations
+import os, sqlite3, pathlib
+from typing import Iterable, List, Dict, Any
+
+DB_PATH = os.getenv("DB_PATH", str(pathlib.Path(__file__).resolve().parent / "bot.db"))
 
 def get_conn() -> sqlite3.Connection:
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
+
+# ---------- bootstrap / migrations ----------
+def _colnames(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 def init_db() -> None:
     conn = get_conn()
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id          INTEGER PRIMARY KEY,
-            username         TEXT,
-            ad_message       TEXT,
-            interval_minutes INTEGER DEFAULT 30,
-            last_sent_at     TEXT,
-            sent_ok          INTEGER DEFAULT 0,
-            sent_fail        INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS user_groups (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER NOT NULL,
-            group_link TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS user_sessions (
-            user_id        INTEGER PRIMARY KEY,
-            api_id         INTEGER NOT NULL,
-            api_hash       TEXT NOT NULL,
-            session_string TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS settings (
+    cur = conn.cursor()
+
+    # settings key/value
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
             val TEXT
-        );
-        """
-    )
-    # ensure global counter key exists
-    conn.execute("INSERT INTO settings(key, val) VALUES('total_sent_ok','0') ON CONFLICT(key) DO NOTHING")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_groups_user_id ON user_groups(user_id);")
-    conn.commit(); conn.close()
+        )
+    """)
 
-# -------- users ----------
-def upsert_user(user_id: int, username: Optional[str] = None) -> None:
+    # users (one row per bot user)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            is_owner INTEGER DEFAULT 0,
+            interval_min INTEGER DEFAULT 30,     -- 30/45/60
+            ad_text TEXT,
+            sent_ok INTEGER DEFAULT 0,
+            last_sent_at TEXT
+        )
+    """)
+    # ensure cols exist if older DB
+    have = _colnames(conn, "users")
+    if "interval_min" not in have:
+        cur.execute("ALTER TABLE users ADD COLUMN interval_min INTEGER DEFAULT 30")
+    if "sent_ok" not in have:
+        cur.execute("ALTER TABLE users ADD COLUMN sent_ok INTEGER DEFAULT 0")
+    if "last_sent_at" not in have:
+        cur.execute("ALTER TABLE users ADD COLUMN last_sent_at TEXT")
+
+    # user_sessions (up to 3 slots per user)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_sessions(
+            user_id INTEGER,
+            slot INTEGER,                         -- 1..3
+            api_id INTEGER,
+            api_hash TEXT,
+            session_string TEXT,
+            PRIMARY KEY(user_id, slot)
+        )
+    """)
+    # migrate: add slot if missing (legacy single-session)
+    have = _colnames(conn, "user_sessions")
+    if "slot" not in have:
+        cur.execute("ALTER TABLE user_sessions ADD COLUMN slot INTEGER")
+        cur.execute("UPDATE user_sessions SET slot=1 WHERE slot IS NULL")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions ON user_sessions(user_id, slot)")
+
+    # groups to forward to (max 5)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_groups(
+            user_id INTEGER,
+            target TEXT,
+            PRIMARY KEY(user_id, target)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+# ---------- generic settings ----------
+def get_setting(key: str, default: str | None = None) -> str | None:
     conn = get_conn()
-    cur = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
-    if cur.fetchone():
-        if username is not None:
-            conn.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
-    else:
-        conn.execute("INSERT INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
-    conn.commit(); conn.close()
+    row = conn.execute("SELECT val FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["val"] if row and row["val"] is not None else default
 
-def users_count() -> int:
-    conn = get_conn(); row = conn.execute("SELECT COUNT(*) c FROM users").fetchone()
-    conn.close(); return row["c"]
-
-# -------- ad & interval ----------
-def set_ad(user_id: int, text: str) -> None:
-    conn = get_conn()
-    conn.execute("UPDATE users SET ad_message = ? WHERE user_id = ?", (text, user_id))
-    conn.commit(); conn.close()
-
-def get_ad(user_id: int) -> str:
-    conn = get_conn()
-    row = conn.execute("SELECT ad_message FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    conn.close(); return row["ad_message"] if row and row["ad_message"] else ""
-
-def set_interval(user_id: int, minutes: int) -> None:
-    conn = get_conn()
-    conn.execute("UPDATE users SET interval_minutes = ? WHERE user_id = ?", (minutes, user_id))
-    conn.commit(); conn.close()
-
-def get_interval(user_id: int) -> int:
-    conn = get_conn()
-    row = conn.execute("SELECT interval_minutes FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    conn.close(); return int(row["interval_minutes"]) if row and row["interval_minutes"] else 30
-
-# -------- groups ----------
-def add_groups(user_id: int, groups: Iterable[str]) -> int:
-    conn = get_conn(); n = 0
-    for g in groups:
-        g = (g or "").strip()
-        if not g: continue
-        conn.execute("INSERT INTO user_groups (user_id, group_link) VALUES (?, ?)", (user_id, g))
-        n += 1
-    conn.commit(); conn.close(); return n
-
-def list_groups(user_id: int):
-    conn = get_conn()
-    rows = conn.execute("SELECT group_link FROM user_groups WHERE user_id = ?", (user_id,)).fetchall()
-    conn.close(); return [r["group_link"] for r in rows]
-
-def clear_groups(user_id: int) -> None:
-    conn = get_conn()
-    conn.execute("DELETE FROM user_groups WHERE user_id = ?", (user_id,))
-    conn.commit(); conn.close()
-
-# -------- sessions ----------
-def list_active_sessions():
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM user_sessions").fetchall()
-    conn.close(); return rows
-
-def sessions_count() -> int:
-    conn = get_conn()
-    row = conn.execute("SELECT COUNT(*) c FROM user_sessions").fetchone()
-    conn.close(); return row["c"]
-
-# -------- counters & stats ----------
-def inc_sent(user_id: int, ok: int, fail: int) -> None:
-    if ok == 0 and fail == 0: return
+def set_setting(key: str, val: str) -> None:
     conn = get_conn()
     conn.execute(
-        "UPDATE users SET sent_ok = COALESCE(sent_ok,0) + ?, sent_fail = COALESCE(sent_fail,0) + ? WHERE user_id = ?",
-        (ok, fail, user_id),
+        "INSERT INTO settings(key,val) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+        (key, val),
     )
-    conn.execute("UPDATE settings SET val = CAST(COALESCE(val,'0') AS INTEGER) + ? WHERE key = 'total_sent_ok'", (ok,))
     conn.commit(); conn.close()
 
-def get_total_sent_ok() -> int:
-    conn = get_conn()
-    row = conn.execute("SELECT val FROM settings WHERE key = 'total_sent_ok'").fetchone()
-    conn.close()
-    try: return int(row["val"]) if row and row["val"] is not None else 0
-    except: return 0
+# ---------- night mode (global owner toggle) ----------
+def get_global_night_mode() -> bool:
+    return (get_setting("global_night_mode", "0") == "1")
 
-def top_users(limit: int = 10):
+def set_global_night_mode(on: bool) -> None:
+    set_setting("global_night_mode", "1" if on else "0")
+
+# ---------- users: interval/ad/stats ----------
+def ensure_user(user_id: int) -> None:
+    conn = get_conn()
+    conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
+    conn.commit(); conn.close()
+
+def set_interval(user_id: int, minutes: int) -> None:
+    ensure_user(user_id)
+    if minutes not in (30, 45, 60):
+        minutes = 30
+    conn = get_conn()
+    conn.execute("UPDATE users SET interval_min=? WHERE user_id=?", (minutes, user_id))
+    conn.commit(); conn.close()
+
+def get_interval(user_id: int) -> int | None:
+    conn = get_conn()
+    row = conn.execute("SELECT interval_min FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return (row["interval_min"] if row else None)
+
+def set_ad(user_id: int, text: str) -> None:
+    ensure_user(user_id)
+    conn = get_conn()
+    conn.execute("UPDATE users SET ad_text=? WHERE user_id=?", (text, user_id))
+    conn.commit(); conn.close()
+
+def get_ad(user_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute("SELECT ad_text FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return (row["ad_text"] if row else None)
+
+def add_sent_ok(user_id: int, inc: int = 1) -> None:
+    ensure_user(user_id)
+    conn = get_conn()
+    conn.execute(
+        "UPDATE users SET sent_ok=COALESCE(sent_ok,0)+?, last_sent_at=datetime('now') WHERE user_id=?",
+        (inc, user_id),
+    )
+    conn.commit(); conn.close()
+
+# ---------- user groups (cap enforced in UI/worker) ----------
+def add_group(user_id: int, target: str) -> None:
+    ensure_user(user_id)
+    conn = get_conn()
+    conn.execute("INSERT OR IGNORE INTO user_groups(user_id, target) VALUES(?,?)", (user_id, target.strip()))
+    conn.commit(); conn.close()
+
+def remove_group(user_id: int, target: str) -> None:
+    conn = get_conn()
+    conn.execute("DELETE FROM user_groups WHERE user_id=? AND target=?", (user_id, target.strip()))
+    conn.commit(); conn.close()
+
+def list_groups(user_id: int) -> list[str]:
+    conn = get_conn()
+    rows = conn.execute("SELECT target FROM user_groups WHERE user_id=? ORDER BY target", (user_id,)).fetchall()
+    conn.close()
+    return [r["target"] for r in rows]
+
+# ---------- sessions (slots 1..3) ----------
+def list_user_sessions(user_id: int) -> List[sqlite3.Row]:
     conn = get_conn()
     rows = conn.execute(
-        """
-        SELECT user_id, username, sent_ok, sent_fail, last_sent_at
-        FROM users
-        ORDER BY COALESCE(sent_ok,0) DESC, COALESCE(last_sent_at,'') DESC
-        LIMIT ?
-        """,
-        (limit,),
+        "SELECT slot, api_id, api_hash, length(session_string) as slen "
+        "FROM user_sessions WHERE user_id=? ORDER BY slot", (user_id,)
     ).fetchall()
-    conn.close(); return rows
+    conn.close()
+    return rows
 
-def update_last_sent(user_id: int, iso: str) -> None:
+def first_free_slot(user_id: int) -> int | None:
+    used = {r["slot"] for r in list_user_sessions(user_id)}
+    for s in (1, 2, 3):
+        if s not in used:
+            return s
+    return None
+
+def count_user_sessions(user_id: int) -> int:
     conn = get_conn()
-    conn.execute("UPDATE users SET last_sent_at = ? WHERE user_id = ?", (iso, user_id))
+    row = conn.execute("SELECT COUNT(*) AS c FROM user_sessions WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return int(row["c"] if row else 0)
+
+def upsert_session_slot(user_id: int, api_id: int, api_hash: str, session_string: str, slot: int | None = None) -> int | None:
+    """Save into provided slot; if None, pick first free slot. Returns slot or None if full."""
+    ensure_user(user_id)
+    if slot is None:
+        slot = first_free_slot(user_id)
+        if slot is None:
+            return None
+    if slot not in (1,2,3):
+        slot = 1
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO user_sessions(user_id, slot, api_id, api_hash, session_string) "
+        "VALUES(?,?,?,?,?) "
+        "ON CONFLICT(user_id, slot) DO UPDATE SET api_id=excluded.api_id, api_hash=excluded.api_hash, session_string=excluded.session_string",
+        (user_id, slot, api_id, api_hash, session_string),
+    )
     conn.commit(); conn.close()
+    return slot
+
+def delete_session_slot(user_id: int, slot: int) -> int:
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM user_sessions WHERE user_id=? AND slot=?", (user_id, slot))
+    conn.commit(); conn.close()
+    return cur.rowcount
