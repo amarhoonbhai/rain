@@ -219,6 +219,22 @@ def sessions_add(user_id: int, api_id: int, api_hash: str, session_string: str) 
             return slot
     return 0
 
+def sessions_upsert_slot(user_id: int, slot: int, api_id: int, api_hash: str, session_string: str) -> int:
+    """
+    Create/replace a session in a specific slot (1..3) for this user.
+    Returns the slot number on success.
+    """
+    slot = int(slot)
+    if slot not in (1, 2, 3):
+        raise ValueError("slot must be 1..3")
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO user_sessions(user_id, slot, api_id, api_hash, session_string) VALUES(?,?,?,?,?)",
+        (user_id, slot, api_id, api_hash, session_string),
+    )
+    conn.commit(); conn.close()
+    return slot
+
 def sessions_delete(user_id: int, slot: int) -> int:
     conn = get_conn()
     cur = conn.execute("DELETE FROM user_sessions WHERE user_id=? AND slot=?", (user_id, slot))
@@ -295,8 +311,8 @@ def get_name_lock(user_id: int):
 
 def name_lock_targets():
     """
-    Yields rows for all users with enabled name-lock.
     Returns list of dicts: {'user_id': int, 'cfg': dict}
+    for all users that have enabled name-lock.
     """
     conn = get_conn()
     rows = conn.execute("SELECT key, val FROM settings WHERE key LIKE 'name_lock:%'").fetchall()
@@ -318,7 +334,7 @@ def name_lock_targets():
 
 # -------------------- compatibility aliases (old names -> new) --------------------
 # users
-def upsertUser(user_id: int, username: str | None = None):  # ultra-legacy
+def upsertUser(user_id: int, username: str | None = None):
     return ensure_user(user_id, username)
 
 # sessions counters
@@ -344,9 +360,12 @@ def get_user_sessions_strings(user_id: int):
 def get_sessions_strings(user_id: int):
     return sessions_strings(user_id)
 
-# sessions add/delete
+# sessions add/delete/upsert-slot
 def add_user_session(user_id: int, api_id: int, api_hash: str, session_string: str) -> int:
     return sessions_add(user_id, api_id, api_hash, session_string)
+
+def upsert_session_slot(user_id: int, slot: int, api_id: int, api_hash: str, session_string: str) -> int:
+    return sessions_upsert_slot(user_id, slot, api_id, api_hash, session_string)
 
 def delete_user_session(user_id: int, slot: int) -> int:
     return sessions_delete(user_id, slot)
