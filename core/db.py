@@ -1,8 +1,4 @@
-# core/db.py — Spinify stack DB helpers (FINAL)
-# Complete: users / sessions / groups / intervals / settings / ads / worker_state
-# Night mode, gate channels, premium name-lock, referrals-ready KV
-# PLUS: Back-compat aliases for older imports (see bottom).
-
+# core/db.py — Spinify stack DB helpers (FINAL + sessions_strings)
 from __future__ import annotations
 import os, json, sqlite3
 from typing import Any, List, Dict, Tuple, Iterator
@@ -82,8 +78,7 @@ def _ensure_indexes(conn: sqlite3.Connection):
 
 def init_db():
     conn = get_conn()
-    _ensure_tables(conn)
-    _ensure_indexes(conn)
+    _ensure_tables(conn); _ensure_indexes(conn)
     conn.close()
 
 # ---------- users & stats ----------
@@ -133,6 +128,27 @@ def sessions_list(user_id: int) -> List[Dict]:
     ).fetchall()
     conn.close(); return rows
 
+def get_user_sessions_full(user_id: int) -> List[Dict]:
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT slot, api_id, api_hash, session_string
+        FROM user_sessions
+        WHERE user_id=?
+        ORDER BY slot
+    """, (user_id,)).fetchall()
+    conn.close(); return rows
+
+def sessions_iter_full() -> Iterator[Dict]:
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT user_id, slot, api_id, api_hash, session_string
+        FROM user_sessions
+        ORDER BY user_id, slot
+    """).fetchall()
+    conn.close()
+    for r in rows:
+        yield r
+
 def sessions_delete(user_id: int, slot: int):
     conn = get_conn()
     conn.execute("DELETE FROM user_sessions WHERE user_id=? AND slot=?", (user_id, slot))
@@ -168,28 +184,33 @@ def sessions_upsert_slot(user_id: int, slot: int, api_id: int, api_hash: str, se
     """, (user_id, slot, api_id, api_hash, session_string))
     conn.commit(); conn.close()
 
-def sessions_iter_full() -> Iterator[Dict]:
+# NEW: full rows including session_string (for worker)
+def sessions_strings(user_id: int | None = None):
+    """
+    Return session rows list:
+    [{user_id, slot, api_id, api_hash, session_string}, ...]
+    If user_id is None, return all users' sessions.
+    """
     conn = get_conn()
-    rows = conn.execute("""
-        SELECT user_id, slot, api_id, api_hash, session_string
-        FROM user_sessions
-        ORDER BY user_id, slot
-    """).fetchall()
+    if user_id is None:
+        rows = conn.execute(
+            "SELECT user_id, slot, api_id, api_hash, session_string "
+            "FROM user_sessions ORDER BY user_id, slot"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT user_id, slot, api_id, api_hash, session_string "
+            "FROM user_sessions WHERE user_id=? ORDER BY slot",
+            (user_id,)
+        ).fetchall()
     conn.close()
-    for r in rows:
-        yield r
+    return rows
 
-def get_user_sessions_full(user_id: int) -> List[Dict]:
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT slot, api_id, api_hash, session_string
-        FROM user_sessions
-        WHERE user_id=?
-        ORDER BY slot
-    """, (user_id,)).fetchall()
-    conn.close(); return rows
+# alias (some codebases use singular)
+def session_strings(user_id: int | None = None):
+    return sessions_strings(user_id)
 
-# ---------- groups (cap 5) ----------
+# ---------- groups ----------
 _GROUPS_CAP = 5
 def groups_cap() -> int: return _GROUPS_CAP
 
@@ -242,12 +263,9 @@ def get_interval(user_id: int) -> int | None:
 
 # ---------- settings (KV) ----------
 def _encode_val(val: Any) -> str:
-    if isinstance(val, (int, float)):
-        return str(val)
-    try:
-        return json.dumps(val, ensure_ascii=False)
-    except Exception:
-        return str(val)
+    if isinstance(val, (int, float)): return str(val)
+    try: return json.dumps(val, ensure_ascii=False)
+    except Exception: return str(val)
 
 def _decode_val(s: str) -> Any:
     if s is None: return None
@@ -255,10 +273,8 @@ def _decode_val(s: str) -> Any:
     if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
         try: return int(s)
         except: pass
-    try:
-        return json.loads(s)
-    except Exception:
-        return s
+    try: return json.loads(s)
+    except Exception: return s
 
 def set_setting(key: str, val: Any):
     conn = get_conn()
@@ -354,32 +370,25 @@ def users_with_sessions() -> List[int]:
     conn.close(); return [r["user_id"] for r in rows]
 
 # ---------- BACKWARD-COMPAT ALIASES ----------
-# Some older modules may import these names; map them to the new API.
 def upsert_user(user_id: int, username: str | None):  # alias -> ensure_user
     return ensure_user(user_id, username)
-
 def count_user_sessions() -> int:  # alias -> sessions_count
     return sessions_count()
-
-def count_user_sessions_user(user_id: int) -> int:  # alias -> sessions_count_user
+def count_user_sessions_user(user_id: int) -> int:
     return sessions_count_user(user_id)
-
-def delete_session_slot(user_id: int, slot: int):  # alias -> sessions_delete
+def delete_session_slot(user_id: int, slot: int):
     return sessions_delete(user_id, slot)
-
 def upsert_session_slot(user_id: int, slot: int, api_id: int, api_hash: str, session_string: str):
     return sessions_upsert_slot(user_id, slot, api_id, api_hash, session_string)
-
-def set_global_night_mode(flag: bool):  # alias -> set_night_enabled
+def set_global_night_mode(flag: bool):
     return set_night_enabled(flag)
 
-# ---------- quick self-test (optional) ----------
-def _selftest_summary() -> Dict[str, Any]:
+# ---------- quick self-test ----------
+def _selftest_summary():
     return {
         "users_count": users_count(),
         "sessions_users": sessions_count(),
         "gate_channels": get_gate_channels_effective(),
         "night_enabled": night_enabled(),
         "schema_ok": True,
-}
-           
+    }
