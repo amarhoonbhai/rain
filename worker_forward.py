@@ -1,10 +1,8 @@
 # worker_forward.py — forwards saved ad text to user groups on schedule
-# • Per-user interval: 30/45/60 minutes (default 30 if unset)
-# • Uses up to 3 sessions (round-robin across slots)
-# • Respects global Night Mode (00:00–07:00 IST) when enabled
-# • Tracks per-user last_sent_at and increments sent_ok stats
-# • Skips users without message or groups or sessions
-# • Gentle throttling & robust error handling
+# • Per-user interval: 30/45/60 minutes (default 30)
+# • Up to 3 sessions (round-robin)
+# • Global Night Mode (00:00–07:00 IST)
+# • Tracks last_sent_at and sent_ok
 
 import asyncio
 import logging
@@ -20,6 +18,8 @@ from core.db import (
     list_groups, get_ad, get_interval, get_last_sent_at, mark_sent_now,
     night_enabled, set_setting, get_setting, inc_sent_ok
 )
+
+__all__ = ["main", "main_loop"]
 
 LOG_LEVEL = "INFO"
 logging.basicConfig(level=LOG_LEVEL)
@@ -48,10 +48,6 @@ def _next_slot_index(user_id: int, total_slots: int) -> int:
     return nxt
 
 async def _send_via_session(sess: dict, groups: list[str], text: str, parse_mode: str | None) -> int:
-    """
-    Send text to each group using given session row.
-    Returns number of successful sends.
-    """
     ok = 0
     app = Client(
         name=f"user-{sess['user_id']}-s{sess['slot']}",
@@ -85,7 +81,6 @@ async def _send_via_session(sess: dict, groups: list[str], text: str, parse_mode
     return ok
 
 async def process_user(user_id: int):
-    # night gate
     if night_enabled() and is_night_now_ist():
         return
 
@@ -105,11 +100,8 @@ async def process_user(user_id: int):
     if last_ts is not None and now - last_ts < interval * 60:
         return  # not due yet
 
-    # round-robin choose one session for this tick
     idx = _next_slot_index(user_id, len(sessions))
-    sess = sessions[idx] if sessions else None
-    if not sess:
-        return
+    sess = sessions[idx]
 
     sent = await _send_via_session(sess, groups, text, _parse_mode_string(mode))
     if sent > 0:
@@ -120,17 +112,19 @@ async def main_loop():
     init_db()
     while True:
         try:
-            user_ids = users_with_sessions()
-            # stagger users to avoid burst
-            for uid in user_ids:
+            for uid in users_with_sessions():
                 try:
                     await process_user(uid)
                 except Exception as e:
                     log.error(f"[u{uid}] process error: {e}")
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.2)  # spread load
         except Exception as e:
             log.error(f"loop error: {e}")
-        await asyncio.sleep(15)  # loop tick
+        await asyncio.sleep(15)  # tick
+
+# <-- this is what run_all.py awaits
+async def main():
+    await main_loop()
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    asyncio.run(main())
