@@ -1,63 +1,92 @@
-# worker_forward.py — robust forwarder with auto-join, target normalization, and AUTO-REHYDRATE
-# • Auto-joins @usernames / invite links before sending
-# • Normalizes https://t.me/... / tg://join?invite=...
-# • Skips channels (requires admin) with clear logs
-# • Per-user interval 30/45/60 (default 30)
-# • Round-robin sessions (<=3)
-# • Night Mode (00:00–07:00 IST)
-# • Verbose logs
-# • AUTO-REHYDRATE: detect expired/unauthorized sessions and DM user to re-login via @SpinifyLoginBot
-
-import os
-import asyncio
-import logging
-import re
-import time as _time
-from urllib.parse import urlparse, parse_qs
+# worker_forward.py — NO-JOIN sender + auto DB normalize + auto-rehydrate notify
+import os, asyncio, logging, re, time as _time
+from urllib.parse import urlparse
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot  # used only for notifying users to re-login
+from aiogram import Bot  # only for DM notify on expired sessions
 
 from pyrogram import Client
 from pyrogram.errors import (
-    FloodWait, RPCError, ChannelPrivate, UsernameInvalid, UsernameNotOccupied,
-    Unauthorized, AuthKeyUnregistered
+    FloodWait, RPCError, UsernameInvalid, UsernameNotOccupied,
+    Unauthorized, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
 )
-# Some installs may not expose these explicitly; we’ll guard with isinstance/str
 try:
-    from pyrogram.errors import SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan
+    from pyrogram.errors import SessionRevoked, SessionExpired, UserNotParticipant
 except Exception:
-    SessionRevoked = SessionExpired = UserDeactivated = UserDeactivatedBan = tuple()
-
-from pyrogram.types import Chat
+    class _Dummy(Exception): pass
+    SessionRevoked = SessionExpired = UserNotParticipant = _Dummy  # best-effort
 
 from core.db import (
     init_db,
     users_with_sessions, sessions_strings,
-    list_groups, get_ad, get_interval, get_last_sent_at, mark_sent_now,
+    list_groups, add_group, clear_groups,
+    get_ad, get_interval, get_last_sent_at, mark_sent_now,
     night_enabled, set_setting, get_setting, inc_sent_ok
 )
-
-__all__ = ["main", "main_loop"]
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("worker")
 
 IST = ZoneInfo("Asia/Kolkata")
-NIGHT_START = time(0, 0)   # 00:00
-NIGHT_END   = time(7, 0)   # 07:00
+NIGHT_START = time(0, 0)
+NIGHT_END   = time(7, 0)
 
-USERNAME_RE = re.compile(r"^@?([A-Za-z0-9_]{5,})$")
+# --- NO JOIN MODE (requested) ---
+NO_AUTO_JOIN = True  # hard off
 
-# --- Bot notifier for auto-rehydrate ---
+# --- Bot notifier for auto-rehydrate (optional) ---
 BOT_TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
-BOT_NOTIFIER: Bot | None = Bot(BOT_TOKEN) if BOT_TOKEN and ":" in BOT_TOKEN else None
-AUTH_PING_COOLDOWN_SEC = 6 * 3600  # 6 hours
+BOT_NOTIFIER = Bot(BOT_TOKEN) if BOT_TOKEN and ":" in BOT_TOKEN else None
+AUTH_PING_COOLDOWN_SEC = 6 * 3600  # 6h
 
-def is_night_now_ist() -> bool:
-    now = datetime.now(IST).time()
-    return NIGHT_START <= now < NIGHT_END
+# --- splitting/normalizing targets ---
+SPLIT_RE = re.compile(r"[,\s]+")
+USERNAME_RE = re.compile(r"^@?([A-Za-z0-9_]{5,})$")
+def expand_targets(raw_targets: list[str]) -> list[str]:
+    out, seen = [], set()
+    for entry in raw_targets or []:
+        if not entry: continue
+        for tok in SPLIT_RE.split(entry.strip()):
+            t = tok.strip().rstrip("/.,")
+            if not t: continue
+            if t not in seen:
+                seen.add(t); out.append(t)
+    return out
+
+def extract_username_from_link(s: str) -> str | None:
+    # Only convert t.me/username -> username ; do NOT touch t.me/+invite
+    if not s.startswith("http"): return None
+    u = urlparse(s)
+    if u.netloc.lower() != "t.me": return None
+    path = u.path.strip("/")
+    if not path or path.startswith("+") or path.startswith("joinchat"):
+        return None
+    uname = path.split("/")[0]
+    return uname if USERNAME_RE.match(uname) else None
+
+def normalize_tokens(tokens: list[str]) -> list[str]:
+    norm = []
+    for t in tokens:
+        if t.lstrip("-").isdigit():            # numeric id
+            norm.append(t)
+            continue
+        m = USERNAME_RE.match(t.lstrip("@"))   # @username
+        if m:
+            norm.append(m.group(1))            # store username without @
+            continue
+        u = extract_username_from_link(t)      # t.me/username
+        if u:
+            norm.append(u)
+            continue
+        # invite links or unknown → keep as-is, but send step will skip
+        norm.append(t)
+    # de-dup preserve order
+    seen, out = set(), []
+    for x in norm:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
 
 def _parse_mode_string(s: str | None):
     if not s: return None
@@ -65,6 +94,10 @@ def _parse_mode_string(s: str | None):
     if s in ("markdown","md"): return "markdown"
     if s in ("html","htm"): return "html"
     return None
+
+def is_night_now_ist() -> bool:
+    now = datetime.now(IST).time()
+    return NIGHT_START <= now < NIGHT_END
 
 def _next_slot_index(user_id: int, total_slots: int) -> int:
     key = f"worker:last_session:{user_id}"
@@ -74,10 +107,7 @@ def _next_slot_index(user_id: int, total_slots: int) -> int:
     return nxt
 
 async def _notify_rehydrate(user_id: int, slot: int, reason: str):
-    """DM user to re-login via @SpinifyLoginBot with cooldown."""
-    if BOT_NOTIFIER is None:
-        log.info(f"[rehydrate u{user_id} s{slot}] notifier disabled (no MAIN_BOT_TOKEN).")
-        return
+    if BOT_NOTIFIER is None: return
     key = f"authping:{user_id}:{slot}"
     last = int(get_setting(key, 0) or 0)
     now = int(_time.time())
@@ -92,103 +122,51 @@ async def _notify_rehydrate(user_id: int, slot: int, reason: str):
     )
     try:
         await BOT_NOTIFIER.send_message(user_id, msg)
-        log.info(f"[rehydrate u{user_id} s{slot}] notified user")
-    except Exception as e:
-        log.info(f"[rehydrate u{user_id} s{slot}] notify failed: {e}")
+    except Exception:
+        pass
 
-def normalize_target(raw: str) -> tuple[str, str]:
+async def resolve_target_chat(app: Client, target: str):
     """
-    Return (kind, value)
-    kind: 'username' | 'invite' | 'id'
-    value:
-      - username without @ (e.g., 'MyGroup')
-      - invite link string (e.g., 'https://t.me/+abcdEF...')
-      - numeric id string for -100 chats (if provided)
+    NO-JOIN: only resolve; never join.
+    - username -> get_chat('username')
+    - numeric id -> get_chat(int)
+    - invite links: return None (user handles joining manually)
     """
-    s = (raw or "").strip()
-    if not s:
-        return ("", "")
-
-    # Numeric id?
-    if s.lstrip("-").isdigit():
-        return ("id", s)
-
-    # Username like @name
-    m = USERNAME_RE.match(s.lstrip("@"))
-    if m and not s.startswith("https://") and not s.startswith("tg://"):
-        return ("username", m.group(1))
-
-    # Telegram links
-    if s.startswith("https://") or s.startswith("http://"):
-        u = urlparse(s)
-        if u.netloc.lower() == "t.me":
-            path = u.path.strip("/")
-            if path.startswith("+") or path.startswith("joinchat"):
-                return ("invite", s)
-            seg = path.split("/")[0]
-            if USERNAME_RE.match(seg):
-                return ("username", seg)
-            return ("invite", s)  # fallback
-        return ("invite", s)
-
-    # tg://join?invite=...
-    if s.startswith("tg://"):
-        u = urlparse(s)
-        q = parse_qs(u.query)
-        inv = q.get("invite", [None])[0]
-        if inv:
-            return ("invite", f"https://t.me/+{inv}")
-
-    # Last resort: try as username
-    return ("username", s.lstrip("@"))
-
-async def ensure_joined(app: Client, kind: str, value: str) -> Chat | None:
-    """Ensure the session is in the target chat. Returns Chat or None."""
-    try:
-        if kind == "id":
-            chat = await app.get_chat(int(value))
-            return chat
-        if kind == "username":
-            uname = value
-            chat = None
+    # numeric id
+    if target.lstrip("-").isdigit():
+        try:
+            return await app.get_chat(int(target))
+        except Exception as e:
+            log.info(f"[resolve] id {target} failed: {e}")
+            return None
+    # pure username
+    m = USERNAME_RE.match(target.lstrip("@"))
+    if m:
+        uname = m.group(1)
+        try:
+            return await app.get_chat(uname)
+        except (UsernameInvalid, UsernameNotOccupied):
+            log.info(f"[resolve] @{uname} invalid/not occupied")
+            return None
+        except Exception as e:
+            log.info(f"[resolve] @{uname} failed: {e}")
+            return None
+    # links
+    if target.startswith("http"):
+        u = extract_username_from_link(target)
+        if u:
             try:
-                chat = await app.get_chat(uname)
-            except (UsernameInvalid, UsernameNotOccupied):
-                chat = None
-            try:
-                await app.join_chat(uname)
-            except Exception:
-                pass  # already joined or not required
-            if chat is None:
-                chat = await app.get_chat(uname)
-            return chat
-        if kind == "invite":
-            try:
-                chat = await app.join_chat(value)
+                return await app.get_chat(u)
             except Exception as e:
-                log.info(f"[join] invite join failed: {e} — trying resolve")
-                try:
-                    k2, v2 = normalize_target(value.replace("joinchat/", "").replace("+", ""))
-                    if k2 == "username":
-                        try: await app.join_chat(v2)
-                        except Exception: pass
-                        chat = await app.get_chat(v2)
-                        return chat
-                except Exception:
-                    pass
+                log.info(f"[resolve] link→@{u} failed: {e}")
                 return None
-            return chat
-    except ChannelPrivate:
-        log.info("[join] channel is private (need admin/invite)")
+        # invite link: skip in NO-JOIN mode
+        log.info(f"[resolve] invite link skipped (NO-JOIN): {target}")
         return None
-    except Unauthorized as e:
-        # session invalid during join step
-        raise e
-    except Exception as e:
-        log.info(f"[join] unexpected: {e}")
-        return None
+    # unknown
+    return None
 
-async def _send_via_session(sess: dict, raw_targets: list[str], text: str, parse_mode: str | None) -> int:
+async def _send_via_session(sess: dict, targets: list[str], text: str, parse_mode: str | None) -> int:
     ok = 0
     app = Client(
         name=f"user-{sess['user_id']}-s{sess['slot']}",
@@ -199,46 +177,30 @@ async def _send_via_session(sess: dict, raw_targets: list[str], text: str, parse
     try:
         await app.start()
     except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
-        # auto-rehydrate notify
         await _notify_rehydrate(sess["user_id"], sess["slot"], e.__class__.__name__)
         log.error(f"[u{sess['user_id']} s{sess['slot']}] start auth error: {e}")
         return 0
     except Exception as e:
         log.error(f"[u{sess['user_id']} s{sess['slot']}] start failed: {e}")
-        # unknown error; don't notify
         return 0
 
-    for raw in raw_targets:
-        kind, val = normalize_target(raw)
-        if not val:
-            log.info(f"[u{sess['user_id']}] skip empty target")
-            continue
-
-        try:
-            chat = await ensure_joined(app, kind, val)
-        except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
-            await _notify_rehydrate(sess["user_id"], sess["slot"], e.__class__.__name__)
-            log.error(f"[u{sess['user_id']} s{sess['slot']}] auth error while joining: {e}")
-            chat = None
-
+    for tgt in targets:
+        chat = await resolve_target_chat(app, tgt)
         if chat is None:
-            log.info(f"[u{sess['user_id']}] could not join/resolve: {raw}")
+            log.info(f"[u{sess['user_id']}] unresolved/unsupported target: {tgt}")
             continue
 
-        # Skip channels unless admin (users can't post to channels)
-        if getattr(chat, "type", "") == "channel":
-            log.info(f"[u{sess['user_id']}] skipping channel (need admin): {getattr(chat,'username',None) or chat.id}")
-            continue
-
-        target_id = chat.id
+        # channels usually require admin; we still try send—will error if not allowed
         try:
-            await app.send_message(chat_id=target_id, text=text, parse_mode=parse_mode)
+            await app.send_message(chat_id=chat.id, text=text, parse_mode=parse_mode)
             ok += 1
             log.info(f"[u{sess['user_id']} s{sess['slot']}] sent to {getattr(chat,'username',None) or chat.id}")
             await asyncio.sleep(0.5)
         except FloodWait as fw:
             log.warning(f"[u{sess['user_id']} s{sess['slot']}] FloodWait {fw.value}s on {chat.id}")
             await asyncio.sleep(fw.value + 1)
+        except UserNotParticipant as e:
+            log.info(f"[u{sess['user_id']}] not a participant in {getattr(chat,'username',None) or chat.id} (NO-JOIN)")
         except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
             await _notify_rehydrate(sess["user_id"], sess["slot"], e.__class__.__name__)
             log.error(f"[u{sess['user_id']} s{sess['slot']}] auth error on send: {e}")
@@ -253,9 +215,29 @@ async def _send_via_session(sess: dict, raw_targets: list[str], text: str, parse
         pass
     return ok
 
+def _normalize_groups_in_db_once(user_id: int):
+    key = f"norm:groups:{user_id}"
+    if get_setting(key, 0):
+        return
+    original = list_groups(user_id)
+    tokens = expand_targets(original)
+    tokens = normalize_tokens(tokens)
+    # If nothing changes, still mark as done
+    if tokens and (len(tokens) != len(original) or set(tokens) != set(original)):
+        clear_groups(user_id)
+        added = 0
+        for t in tokens:
+            try: added += add_group(user_id, t)
+            except Exception: pass
+        log.info(f"[u{user_id}] normalized groups {len(original)}→{len(tokens)}, added={added}")
+    set_setting(key, 1)
+
 async def process_user(user_id: int):
     if night_enabled() and is_night_now_ist():
         return
+
+    # one-time DB normalization
+    _normalize_groups_in_db_once(user_id)
 
     text, mode = get_ad(user_id)
     if not text:
@@ -281,7 +263,13 @@ async def process_user(user_id: int):
     idx = _next_slot_index(user_id, len(sessions))
     sess = sessions[idx]
 
-    sent = await _send_via_session(sess, groups, text, _parse_mode_string(mode))
+    # expand again at runtime (safe)
+    targets = normalize_tokens(expand_targets(groups))
+    if not targets:
+        log.info(f"[u{user_id}] no valid targets after expansion")
+        return
+
+    sent = await _send_via_session(sess, targets, text, _parse_mode_string(mode))
     if sent > 0:
         mark_sent_now(user_id)
         inc_sent_ok(user_id, sent)
