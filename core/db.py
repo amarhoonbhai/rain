@@ -1,8 +1,9 @@
-# core/db.py — Spinify stack DB helpers (CLEAN, FINAL)
+# core/db.py — Spinify stack DB helpers (FINAL, CLEAN)
 from __future__ import annotations
 import os, json, sqlite3
 from typing import Any, List, Dict, Tuple, Iterator
 
+# ---------- DB path ----------
 DB_PATH = os.getenv("DB_PATH", "./data.db")
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
@@ -30,7 +31,7 @@ def _ensure_tables(conn: sqlite3.Connection):
         sent_ok     INTEGER DEFAULT 0
     )""")
 
-    # User sessions (up to 3 slots per user)
+    # Sessions (up to 3 slots per user)
     c.execute("""
     CREATE TABLE IF NOT EXISTS user_sessions(
         user_id        INTEGER,
@@ -42,7 +43,7 @@ def _ensure_tables(conn: sqlite3.Connection):
         PRIMARY KEY(user_id, slot)
     )""")
 
-    # Groups per user
+    # Groups per user (targets)
     c.execute("""
     CREATE TABLE IF NOT EXISTS user_groups(
         user_id  INTEGER,
@@ -58,14 +59,14 @@ def _ensure_tables(conn: sqlite3.Connection):
         minutes INTEGER
     )""")
 
-    # Global key/value settings
+    # Global/settings KV
     c.execute("""
     CREATE TABLE IF NOT EXISTS settings(
         key TEXT PRIMARY KEY,
         val TEXT
     )""")
 
-    # Ads per user (text + parse_mode)
+    # Ads (text + parse mode)
     c.execute("""
     CREATE TABLE IF NOT EXISTS ads(
         user_id    INTEGER PRIMARY KEY,
@@ -86,9 +87,9 @@ def _ensure_tables(conn: sqlite3.Connection):
 def _ensure_indexes(conn: sqlite3.Connection):
     c = conn.cursor()
     c.execute("CREATE INDEX IF NOT EXISTS idx_user_groups_uid ON user_groups(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_uid ON user_sessions(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_intervals_uid ON intervals(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_sentok ON users(sent_ok DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_uid   ON user_sessions(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_intervals_uid  ON intervals(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_sentok   ON users(sent_ok DESC)")
     conn.commit()
 
 def init_db():
@@ -188,4 +189,253 @@ def first_free_slot(user_id: int) -> int:
 
 def sessions_upsert_slot(user_id: int, slot: int, api_id: int, api_hash: str, session_string: str):
     conn = get_conn()
-    conn.execute
+    conn.execute("""
+        INSERT INTO user_sessions(user_id, slot, api_id, api_hash, session_string, updated_at)
+        VALUES(?,?,?,?,?,strftime('%s','now'))
+        ON CONFLICT(user_id, slot) DO UPDATE SET
+            api_id=excluded.api_id,
+            api_hash=excluded.api_hash,
+            session_string=excluded.session_string,
+            updated_at=excluded.updated_at
+    """, (user_id, slot, api_id, api_hash, session_string))
+    conn.commit(); conn.close()
+
+def sessions_strings(user_id: int | None = None):
+    """Return rows with session_string for worker/login."""
+    conn = get_conn()
+    if user_id is None:
+        rows = conn.execute(
+            "SELECT user_id, slot, api_id, api_hash, session_string "
+            "FROM user_sessions ORDER BY user_id, slot"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT user_id, slot, api_id, api_hash, session_string "
+            "FROM user_sessions WHERE user_id=? ORDER BY slot",
+            (user_id,)
+        ).fetchall()
+    conn.close()
+    return rows
+
+def session_strings(user_id: int | None = None):  # alias
+    return sessions_strings(user_id)
+
+# ---------- groups ----------
+_GROUPS_CAP = 5
+def groups_cap() -> int: return _GROUPS_CAP
+
+def list_groups(user_id: int) -> List[str]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT group_id FROM user_groups WHERE user_id=? ORDER BY added_at",
+        (user_id,)
+    ).fetchall()
+    conn.close(); return [r["group_id"] for r in rows]
+
+def add_group(user_id: int, gid: str) -> int:
+    gid = (gid or "").strip()
+    if not gid: return 0
+    if len(list_groups(user_id)) >= groups_cap(): return 0
+    conn = get_conn()
+    try:
+        conn.execute("INSERT INTO user_groups(user_id, group_id) VALUES(?,?)", (user_id, gid))
+        conn.commit(); return 1
+    except sqlite3.IntegrityError:
+        return 0
+    finally:
+        conn.close()
+
+def clear_groups(user_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM user_groups WHERE user_id=?", (user_id,))
+    conn.commit(); conn.close()
+
+def groups_iter_all() -> Iterator[Dict]:
+    conn = get_conn()
+    rows = conn.execute("SELECT user_id, group_id FROM user_groups ORDER BY user_id, added_at").fetchall()
+    conn.close()
+    for r in rows:
+        yield r
+
+# ---------- intervals ----------
+def set_interval(user_id: int, minutes: int):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO intervals(user_id, minutes) VALUES(?,?)
+        ON CONFLICT(user_id) DO UPDATE SET minutes=excluded.minutes
+    """, (user_id, minutes))
+    conn.commit(); conn.close()
+
+def get_interval(user_id: int) -> int | None:
+    conn = get_conn()
+    r = conn.execute("SELECT minutes FROM intervals WHERE user_id=?", (user_id,)).fetchone()
+    conn.close(); return (r["minutes"] if r else None)
+
+# ---------- settings (KV) ----------
+def _encode_val(val: Any) -> str:
+    if isinstance(val, (int, float)): return str(val)
+    try: return json.dumps(val, ensure_ascii=False)
+    except Exception: return str(val)
+
+def _decode_val(s: str) -> Any:
+    if s is None: return None
+    s = str(s)
+    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+        try: return int(s)
+        except: pass
+    try: return json.loads(s)
+    except Exception: return s
+
+def set_setting(key: str, val: Any):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO settings(key,val) VALUES(?,?)
+        ON CONFLICT(key) DO UPDATE SET val=excluded.val
+    """, (key, _encode_val(val)))
+    conn.commit(); conn.close()
+
+def get_setting(key: str, default: Any=None) -> Any:
+    conn = get_conn()
+    r = conn.execute("SELECT val FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return _decode_val(r["val"]) if r and r.get("val") is not None else default
+
+# ---------- night mode ----------
+def night_enabled() -> bool:
+    return bool(int(get_setting("night:enabled", 0) or 0))
+
+def set_night_enabled(flag: bool):
+    set_setting("night:enabled", 1 if flag else 0)
+
+# ---------- gate channels (membership gating) ----------
+def get_gate_channels() -> Tuple[str, str]:
+    ch1 = get_setting("gate:ch1", "") or ""
+    ch2 = get_setting("gate:ch2", "") or ""
+    return (str(ch1), str(ch2))
+
+def set_gate_channels(ch1: str | None, ch2: str | None):
+    if ch1 is not None: set_setting("gate:ch1", ch1)
+    if ch2 is not None: set_setting("gate:ch2", ch2)
+
+def get_gate_channels_effective() -> Tuple[str, str]:
+    env1 = (os.getenv("GATE_CHANNEL_1") or "").strip()
+    env2 = (os.getenv("GATE_CHANNEL_2") or "").strip()
+    if env1 or env2:
+        return (env1, env2)
+    return get_gate_channels()
+
+# ---------- premium name-lock ----------
+def set_name_lock(user_id: int, enabled: bool, name: str | None = None):
+    set_setting(f"user:{user_id}:name_lock", 1 if enabled else 0)
+    if name is not None:
+        set_setting(f"user:{user_id}:locked_name", name)
+
+def name_lock_enabled(user_id: int) -> bool:
+    return bool(int(get_setting(f"user:{user_id}:name_lock", 0) or 0))
+
+def locked_name(user_id: int) -> str | None:
+    v = get_setting(f"user:{user_id}:locked_name", None)
+    return v if v else None
+
+# ---------- ads ----------
+def set_ad(user_id: int, text: str, parse_mode: str | None = None):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO ads(user_id, text, parse_mode, updated_at)
+        VALUES(?,?,?,strftime('%s','now'))
+        ON CONFLICT(user_id) DO UPDATE SET
+            text=excluded.text,
+            parse_mode=excluded.parse_mode,
+            updated_at=excluded.updated_at
+    """, (user_id, text, (parse_mode or None)))
+    conn.commit(); conn.close()
+
+def get_ad(user_id: int) -> Tuple[str | None, str | None]:
+    conn = get_conn()
+    r = conn.execute("SELECT text, parse_mode FROM ads WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    if not r: return (None, None)
+    return (r["text"], r["parse_mode"])
+
+# ---------- worker state ----------
+def get_last_sent_at(user_id: int) -> int | None:
+    conn = get_conn()
+    r = conn.execute("SELECT last_sent_at FROM worker_state WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return int(r["last_sent_at"]) if r and r["last_sent_at"] is not None else None
+
+def mark_sent_now(user_id: int):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO worker_state(user_id, last_sent_at)
+        VALUES(?, strftime('%s','now'))
+        ON CONFLICT(user_id) DO UPDATE SET last_sent_at=excluded.last_sent_at
+    """, (user_id,))
+    conn.commit(); conn.close()
+
+# ---------- helpers for workers ----------
+def users_with_sessions() -> List[int]:
+    conn = get_conn()
+    rows = conn.execute("SELECT DISTINCT user_id FROM user_sessions").fetchall()
+    conn.close(); return [r["user_id"] for r in rows]
+
+# ---------- backward-compat aliases ----------
+def upsert_user(user_id: int, username: str | None):  # alias -> ensure_user
+    return ensure_user(user_id, username)
+
+def count_user_sessions() -> int:  # alias -> sessions_count
+    return sessions_count()
+
+def count_user_sessions_user(user_id: int) -> int:
+    return sessions_count_user(user_id)
+
+def delete_session_slot(user_id: int, slot: int):
+    return sessions_delete(user_id, slot)
+
+def upsert_session_slot(user_id: int, slot: int, api_id: int, api_hash: str, session_string: str):
+    return sessions_upsert_slot(user_id, slot, api_id, api_hash, session_string)
+
+def set_global_night_mode(flag: bool):
+    return set_night_enabled(flag)
+
+# ---------- debug/selftest ----------
+def _selftest_summary():
+    return {
+        "users_count": users_count(),
+        "sessions_users": sessions_count(),
+        "gate_channels": get_gate_channels_effective(),
+        "night_enabled": night_enabled(),
+        "schema_ok": True,
+    }
+
+__all__ = [
+    # core
+    "init_db","get_conn",
+    # users & stats
+    "ensure_user","users_count","all_user_ids","inc_sent_ok","get_total_sent_ok","top_users",
+    # sessions
+    "sessions_list","get_user_sessions_full","sessions_iter_full","sessions_delete",
+    "sessions_count","sessions_count_user","first_free_slot","sessions_upsert_slot",
+    "sessions_strings","session_strings",
+    # groups
+    "groups_cap","list_groups","add_group","clear_groups","groups_iter_all",
+    # intervals
+    "set_interval","get_interval",
+    # settings
+    "set_setting","get_setting",
+    # night mode
+    "night_enabled","set_night_enabled",
+    # gate channels
+    "get_gate_channels","set_gate_channels","get_gate_channels_effective",
+    # premium name lock
+    "set_name_lock","name_lock_enabled","locked_name",
+    # ads
+    "set_ad","get_ad",
+    # worker state
+    "get_last_sent_at","mark_sent_now",
+    # worker helpers
+    "users_with_sessions",
+    # aliases
+    "upsert_user","count_user_sessions","count_user_sessions_user",
+    "delete_session_slot","upsert_session_slot","set_global_night_mode",
+                                        ]
