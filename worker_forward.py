@@ -1,13 +1,13 @@
 # worker_forward.py — Pinned-Saved forwarder (NO-JOIN)
 # Sends the PINNED message from Saved Messages of each session to saved groups.
-# Respects Pause, Night Mode, and user intervals. No per-group cooldown.
+# Respects Pause, Night Mode, 30/45/60 intervals. Canonicalizes to chat_id on first success.
 
 import os, asyncio, logging, re, time as _time
 from urllib.parse import urlparse
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot  # only for optional DM notifications
+from aiogram import Bot  # optional DM notifications
 
 from pyrogram import Client
 from pyrogram.errors import (
@@ -18,14 +18,15 @@ try:
     from pyrogram.errors import SessionRevoked, SessionExpired, UserNotParticipant
 except Exception:
     class _Dummy(Exception): pass
-    SessionRevoked = SessionExpired = UserNotParticipant = _Dummy  # best-effort
+    SessionRevoked = SessionExpired = UserNotParticipant = _Dummy
 
 from core.db import (
     init_db,
     users_with_sessions, sessions_strings,
     list_groups,
-    get_interval, get_last_sent_at, mark_sent_now,
+    get_interval, get_last_sent_at, mark_sent_now, reset_last_sent,
     night_enabled, set_setting, get_setting, inc_sent_ok,
+    replace_group_value,
 )
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
@@ -35,18 +36,16 @@ IST = ZoneInfo("Asia/Kolkata")
 NIGHT_START = time(0, 0)
 NIGHT_END   = time(7, 0)
 
-# --- Bot notifier for auth / session issues (optional) ---
 BOT_TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 BOT_NOTIFIER = Bot(BOT_TOKEN) if BOT_TOKEN and ":" in BOT_TOKEN else None
-AUTH_PING_COOLDOWN_SEC = 6 * 3600  # 6 hours
+AUTH_PING_COOLDOWN_SEC = 6 * 3600  # 6h
 
-# --- parsing/normalizing targets ---
 SPLIT_RE = re.compile(r"[,\s]+")
 USERNAME_RE = re.compile(r"^@?([A-Za-z0-9_]{5,})$")
 
-def expand_targets(raw_targets: list[str]) -> list[str]:
+def expand_targets(raw: list[str]) -> list[str]:
     out, seen = [], set()
-    for entry in raw_targets or []:
+    for entry in raw or []:
         if not entry: continue
         for tok in SPLIT_RE.split(entry.strip()):
             t = tok.strip().rstrip("/.,")
@@ -56,7 +55,6 @@ def expand_targets(raw_targets: list[str]) -> list[str]:
     return out
 
 def extract_username_from_link(s: str) -> str | None:
-    # Only convert t.me/username -> username ; do NOT touch t.me/+invite
     if not s.startswith("http"): return None
     u = urlparse(s)
     if u.netloc.lower() != "t.me": return None
@@ -69,27 +67,18 @@ def extract_username_from_link(s: str) -> str | None:
 def normalize_tokens(tokens: list[str]) -> list[str]:
     norm = []
     for t in tokens:
-        if t.lstrip("-").isdigit():            # numeric id
+        if t.lstrip("-").isdigit():
             norm.append(t); continue
-        m = USERNAME_RE.match(t.lstrip("@"))   # @username
+        m = USERNAME_RE.match(t.lstrip("@"))
         if m: norm.append(m.group(1)); continue
-        u = extract_username_from_link(t)      # t.me/username
+        u = extract_username_from_link(t)
         if u: norm.append(u); continue
-        # invite links or unknown → keep as-is (we'll log reminder)
-        norm.append(t)
-    # de-dup preserve order
+        norm.append(t)  # keep invites/raw
     seen, out = set(), []
     for x in norm:
         if x not in seen:
             seen.add(x); out.append(x)
     return out
-
-def _parse_mode_string(s: str | None):
-    if not s: return None
-    s = s.strip().lower()
-    if s in ("markdown","md"): return "markdown"
-    if s in ("html","htm"): return "html"
-    return None
 
 def is_night_now_ist() -> bool:
     now = datetime.now(IST).time()
@@ -126,13 +115,6 @@ async def _notify_rehydrate(user_id: int, slot: int, reason: str):
         pass
 
 async def resolve_target_chat(app: Client, target: str):
-    """
-    NO-JOIN: only resolve; never join.
-    - username -> get_chat('username')
-    - numeric id -> get_chat(int)
-    - public link t.me/username -> same as username
-    - private invite links: return None (user must join manually); we log a reminder
-    """
     # numeric id
     if target.lstrip("-").isdigit():
         try:
@@ -161,17 +143,11 @@ async def resolve_target_chat(app: Client, target: str):
             except Exception as e:
                 log.info(f"[resolve] link→@{u} failed: {e}")
                 return None
-        # invite link: skip in NO-JOIN mode
-        log.info(f"[resolve] private invite link saved; requires manual join: {target}")
+        log.info(f"[resolve] private invite saved; requires manual join: {target}")
         return None
-    # unknown
     return None
 
 async def _copy_pinned_from_saved(app: Client, to_chat_id: int) -> bool:
-    """
-    Copy the pinned message from 'Saved Messages' (me) to target chat.
-    Works for text or media+caption (premium emoji OK).
-    """
     try:
         me_chat = await app.get_chat("me")
         pin = getattr(me_chat, "pinned_message", None)
@@ -181,7 +157,7 @@ async def _copy_pinned_from_saved(app: Client, to_chat_id: int) -> bool:
         await app.copy_message(chat_id=to_chat_id, from_chat_id="me", message_id=pin.id)
         return True
     except FloodWait as fw:
-        log.warning(f"[pinned] FloodWait {fw.value}s on copy → sleep")
+        log.warning(f"[pinned] FloodWait {fw.value}s on copy")
         await asyncio.sleep(fw.value + 1)
     except RPCError as e:
         log.warning(f"[pinned] RPCError on copy: {e}")
@@ -191,6 +167,7 @@ async def _copy_pinned_from_saved(app: Client, to_chat_id: int) -> bool:
 
 async def _send_via_session(sess: dict, targets: list[str]) -> int:
     ok = 0
+    skipped: list[str] = []
     app = Client(
         name=f"user-{sess['user_id']}-s{sess['slot']}",
         api_id=int(sess["api_id"]),
@@ -210,22 +187,29 @@ async def _send_via_session(sess: dict, targets: list[str]) -> int:
     for tgt in targets:
         chat = await resolve_target_chat(app, tgt)
         if chat is None:
-            # likely private invite or bad token; we log and move on
+            skipped.append(tgt)
             log.info(f"[u{sess['user_id']}] unresolved/needs manual join: {tgt}")
             continue
         try:
             sent = await _copy_pinned_from_saved(app, chat.id)
             if sent:
                 ok += 1
+                # Canonicalize to numeric id
+                if not str(tgt).lstrip("-").isdigit():
+                    try:
+                        replace_group_value(sess["user_id"], tgt, str(chat.id))
+                    except Exception:
+                        pass
                 log.info(f"[u{sess['user_id']} s{sess['slot']}] sent to {getattr(chat,'username',None) or chat.id}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.7)
             else:
                 log.info(f"[u{sess['user_id']} s{sess['slot']}] no pinned content to send")
         except FloodWait as fw:
             log.warning(f"[u{sess['user_id']} s{sess['slot']}] FloodWait {fw.value}s on {chat.id}")
             await asyncio.sleep(fw.value + 1)
         except UserNotParticipant:
-            log.info(f"[u{sess['user_id']}] not a participant in {getattr(chat,'username',None) or chat.id} (private invite)")
+            skipped.append(tgt)
+            log.info(f"[u{sess['user_id']}] not a participant in {getattr(chat,'username',None) or chat.id}")
         except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
             await _notify_rehydrate(sess["user_id"], sess["slot"], e.__class__.__name__)
             log.error(f"[u{sess['user_id']} s{sess['slot']}] auth error on send: {e}")
@@ -238,28 +222,39 @@ async def _send_via_session(sess: dict, targets: list[str]) -> int:
         await app.stop()
     except Exception:
         pass
+
+    if BOT_NOTIFIER and skipped:
+        try:
+            note = "✇ Some targets were skipped:\n" + "\n".join(f"• {x}" for x in skipped) + \
+                   "\n✇ Tip: Convert private invites to numeric chat IDs and ensure the account is a member."
+            await BOT_NOTIFIER.send_message(sess["user_id"], note)
+        except Exception:
+            pass
+
     return ok
 
 async def process_user(user_id: int):
-    # honor Pause
     if _is_paused(user_id):
         return
-    # honor Night Mode
     if night_enabled() and is_night_now_ist():
         return
 
     groups = list_groups(user_id)
     if not groups:
-        log.info(f"[u{user_id}] no groups configured")
-        return
+        log.info(f"[u{user_id}] no groups configured"); return
     sessions = sessions_strings(user_id)
     if not sessions:
-        log.info(f"[u{user_id}] no sessions")
-        return
+        log.info(f"[u{user_id}] no sessions"); return
 
     interval = get_interval(user_id) or 30
     last_ts = get_last_sent_at(user_id)
     now = int(datetime.utcnow().timestamp())
+
+    # auto-heal future timestamps
+    if last_ts is not None and last_ts > now + 60:
+        reset_last_sent(user_id)
+        last_ts = 0
+
     if last_ts is not None and now - last_ts < interval * 60:
         remain = interval*60 - (now - last_ts)
         log.info(f"[u{user_id}] not due yet ({remain}s left)")
@@ -268,7 +263,6 @@ async def process_user(user_id: int):
     idx = _next_slot_index(user_id, len(sessions))
     sess = sessions[idx]
 
-    # expand + normalize once per tick
     targets = normalize_tokens(expand_targets(groups))
     if not targets:
         log.info(f"[u{user_id}] no valid targets after expansion")
