@@ -1,441 +1,377 @@
-# core/db.py — Spinify stack DB helpers (FINAL, CLEAN)
-from __future__ import annotations
-import os, json, sqlite3
-from typing import Any, List, Dict, Tuple, Iterator
+# worker_forward.py — NO-JOIN sender + invite-link aware + auto DB normalize + auto-rehydrate
+import os, asyncio, logging, re
+from urllib.parse import urlparse
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
-# ---------- DB path ----------
-DB_PATH = os.getenv("DB_PATH", "./data.db")
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+from aiogram import Bot  # only for DM notify on expired sessions
 
-def _row_factory(cursor, row):
-    return {d[0]: row[i] for i, d in enumerate(cursor.description)}
+from pyrogram import Client
+from pyrogram.errors import (
+    FloodWait, RPCError, UsernameInvalid, UsernameNotOccupied,
+    Unauthorized, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
+)
+try:
+    from pyrogram.errors import SessionRevoked, SessionExpired, UserNotParticipant
+except Exception:
+    class _Dummy(Exception): pass
+    SessionRevoked = SessionExpired = UserNotParticipant = _Dummy  # best-effort
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
-    conn.row_factory = _row_factory
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+from core.db import (
+    init_db,
+    users_with_sessions, sessions_strings,
+    list_groups, add_group, clear_groups,
+    get_ad, get_interval, get_last_sent_at, mark_sent_now,
+    night_enabled, set_setting, get_setting, inc_sent_ok
+)
 
-# ---------- schema ----------
-def _ensure_tables(conn: sqlite3.Connection):
-    c = conn.cursor()
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("worker")
 
-    # Users
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        user_id     INTEGER PRIMARY KEY,
-        username    TEXT,
-        created_at  INTEGER DEFAULT (strftime('%s','now')),
-        sent_ok     INTEGER DEFAULT 0
-    )""")
+# ---------- time/locale ----------
+IST = ZoneInfo("Asia/Kolkata")
+NIGHT_START = time(0, 0)   # 00:00
+NIGHT_END   = time(7, 0)   # 07:00
 
-    # Sessions (up to 3 slots per user)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS user_sessions(
-        user_id        INTEGER,
-        slot           INTEGER,
-        api_id         INTEGER,
-        api_hash       TEXT,
-        session_string TEXT,
-        updated_at     INTEGER DEFAULT (strftime('%s','now')),
-        PRIMARY KEY(user_id, slot)
-    )""")
+# ---------- behavior flags (env-tunable) ----------
+# accept private invite links like t.me/+AbCd… / t.me/joinchat/AAAA…
+ALLOW_INVITE_LINKS = os.getenv("ALLOW_INVITE_LINKS", "1") == "1"   # default ON
+# keep no-join by default; flip to "0" only if you want worker to join
+NO_AUTO_JOIN       = os.getenv("NO_AUTO_JOIN", "1") == "1"         # default ON
+# allow auto-joining from invite links (effective only if NO_AUTO_JOIN == False)
+JOIN_FROM_INVITE   = os.getenv("JOIN_FROM_INVITE", "0") == "1"     # default OFF
 
-    # Groups per user (targets)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS user_groups(
-        user_id  INTEGER,
-        group_id TEXT,
-        added_at INTEGER DEFAULT (strftime('%s','now')),
-        UNIQUE(user_id, group_id)
-    )""")
+# accept only numeric targets (drop usernames/normal links). still keeps invite links if allowed
+TARGET_NUMERIC_ONLY = os.getenv("TARGET_NUMERIC_ONLY", "1") == "1"
 
-    # Per-user interval (minutes)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS intervals(
-        user_id INTEGER PRIMARY KEY,
-        minutes INTEGER
-    )""")
+# auto-rehydrate notifier
+BOT_TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+BOT_NOTIFIER = Bot(BOT_TOKEN) if BOT_TOKEN and ":" in BOT_TOKEN else None
+AUTH_PING_COOLDOWN_SEC = 6 * 3600  # 6h
 
-    # Global/settings KV
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS settings(
-        key TEXT PRIMARY KEY,
-        val TEXT
-    )""")
+def _as_int(v, default=0):
+    try: return int(str(v))
+    except Exception: return default
 
-    # Ads (text + parse mode)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS ads(
-        user_id    INTEGER PRIMARY KEY,
-        text       TEXT,
-        parse_mode TEXT,
-        updated_at INTEGER DEFAULT (strftime('%s','now'))
-    )""")
+def _now_ts() -> int:
+    return int(datetime.utcnow().timestamp())
 
-    # Worker last-send timestamps
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS worker_state(
-        user_id      INTEGER PRIMARY KEY,
-        last_sent_at INTEGER
-    )""")
+def is_night_now_ist() -> bool:
+    now = datetime.now(IST).time()
+    return NIGHT_START <= now < NIGHT_END
 
-    conn.commit()
+def _parse_mode_string(s: str | None):
+    if not s: return None
+    s = s.strip().lower()
+    if s in ("markdown","md"): return "markdown"
+    if s in ("html","htm"):    return "html"
+    return None
 
-def _ensure_indexes(conn: sqlite3.Connection):
-    c = conn.cursor()
-    c.execute("CREATE INDEX IF NOT EXISTS idx_user_groups_uid ON user_groups(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_uid   ON user_sessions(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_intervals_uid  ON intervals(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_sentok   ON users(sent_ok DESC)")
-    conn.commit()
+# ---------- splitting/normalizing targets ----------
+SPLIT_RE = re.compile(r"[,\s]+")
+USERNAME_RE = re.compile(r"^@?([A-Za-z0-9_]{5,})$")
+INVITE_RE = re.compile(r"^(?:https?://)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_\-]+)$", re.IGNORECASE)
 
-def init_db():
-    conn = get_conn()
-    _ensure_tables(conn); _ensure_indexes(conn)
-    conn.close()
+def is_invite_link(s: str) -> bool:
+    return bool(INVITE_RE.match((s or "").strip()))
 
-# ---------- users & stats ----------
-def ensure_user(user_id: int, username: str | None):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users(user_id, username) VALUES(?,?)", (user_id, username))
-    if username is not None:
-        cur.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
-    conn.commit(); conn.close()
+def expand_targets(raw_targets: list[str]) -> list[str]:
+    out, seen = [], set()
+    for entry in raw_targets or []:
+        if not entry: continue
+        for tok in SPLIT_RE.split(entry.strip()):
+            t = tok.strip().rstrip("/.,")
+            if not t: continue
+            if t not in seen:
+                seen.add(t); out.append(t)
+    return out
 
-def users_count() -> int:
-    conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    conn.close(); return int(n or 0)
+def extract_username_from_link(s: str) -> str | None:
+    # Only convert t.me/username -> username ; do NOT touch t.me/+invite
+    if not s.startswith("http"): return None
+    u = urlparse(s)
+    if u.netloc.lower() != "t.me": return None
+    path = u.path.strip("/")
+    if not path or path.startswith("+") or path.startswith("joinchat"):
+        return None
+    uname = path.split("/")[0]
+    return uname if USERNAME_RE.match(uname) else None
 
-def all_user_ids() -> List[int]:
-    conn = get_conn()
-    rows = conn.execute("SELECT user_id FROM users").fetchall()
-    conn.close(); return [r["user_id"] for r in rows]
+def normalize_tokens(tokens: list[str]) -> list[str]:
+    """
+    - Keeps numeric ids always
+    - Keeps private invite links if ALLOW_INVITE_LINKS
+    - If TARGET_NUMERIC_ONLY==1, drops other non-numeric items (usernames/normal links)
+    """
+    norm = []
+    for t in tokens:
+        t = (t or "").strip()
+        if not t:
+            continue
 
-def inc_sent_ok(user_id: int, add: int = 1):
-    conn = get_conn()
-    conn.execute("UPDATE users SET sent_ok=COALESCE(sent_ok,0)+? WHERE user_id=?", (add, user_id))
-    conn.commit(); conn.close()
+        # numeric chat ids (e.g., -1001234567890)
+        if t.lstrip("-").isdigit():
+            norm.append(t)
+            continue
 
-def get_total_sent_ok() -> int:
-    conn = get_conn()
-    s = conn.execute("SELECT SUM(sent_ok) AS s FROM users").fetchone()["s"]
-    conn.close(); return int(s or 0)
+        # invite links
+        if ALLOW_INVITE_LINKS and is_invite_link(t):
+            norm.append(t)
+            continue
 
-def top_users(n: int = 10) -> List[Dict]:
-    n = max(1, min(100, int(n)))
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT user_id, sent_ok FROM users ORDER BY sent_ok DESC, user_id ASC LIMIT ?",
-        (n,)
-    ).fetchall()
-    conn.close(); return rows
+        # numeric-only mode → drop everything else
+        if TARGET_NUMERIC_ONLY:
+            continue
 
-# ---------- sessions (3 slots) ----------
-def sessions_list(user_id: int) -> List[Dict]:
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT slot, api_id, api_hash FROM user_sessions WHERE user_id=? ORDER BY slot",
-        (user_id,)
-    ).fetchall()
-    conn.close(); return rows
+        # fallback: usernames / t.me/username
+        m = USERNAME_RE.match(t.lstrip("@"))
+        if m:
+            norm.append(m.group(1)); continue
 
-def get_user_sessions_full(user_id: int) -> List[Dict]:
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT slot, api_id, api_hash, session_string
-        FROM user_sessions
-        WHERE user_id=?
-        ORDER BY slot
-    """, (user_id,)).fetchall()
-    conn.close(); return rows
+        u = extract_username_from_link(t)
+        if u:
+            norm.append(u); continue
 
-def sessions_iter_full() -> Iterator[Dict]:
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT user_id, slot, api_id, api_hash, session_string
-        FROM user_sessions
-        ORDER BY user_id, slot
-    """).fetchall()
-    conn.close()
-    for r in rows:
-        yield r
+        # keep as-is (unknown)
+        norm.append(t)
 
-def sessions_delete(user_id: int, slot: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM user_sessions WHERE user_id=? AND slot=?", (user_id, slot))
-    conn.commit(); conn.close()
+    # de-dup while preserving order
+    seen, out = set(), []
+    for x in norm:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
 
-def sessions_count() -> int:
-    conn = get_conn()
-    n = conn.execute("SELECT COUNT(DISTINCT user_id) AS c FROM user_sessions").fetchone()["c"]
-    conn.close(); return int(n or 0)
+def _next_slot_index(user_id: int, total_slots: int) -> int:
+    key = f"worker:last_session:{user_id}"
+    cur = _as_int(get_setting(key, -1), -1)
+    nxt = (cur + 1) % max(1, total_slots)
+    set_setting(key, nxt)
+    return nxt
 
-def sessions_count_user(user_id: int) -> int:
-    conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) AS c FROM user_sessions WHERE user_id=?", (user_id,)).fetchone()["c"]
-    conn.close(); return int(n or 0)
-
-def first_free_slot(user_id: int) -> int:
-    used = {r["slot"] for r in sessions_list(user_id)}
-    for s in (1, 2, 3):
-        if s not in used:
-            return s
-    return 0
-
-def sessions_upsert_slot(user_id: int, slot: int, api_id: int, api_hash: str, session_string: str):
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO user_sessions(user_id, slot, api_id, api_hash, session_string, updated_at)
-        VALUES(?,?,?,?,?,strftime('%s','now'))
-        ON CONFLICT(user_id, slot) DO UPDATE SET
-            api_id=excluded.api_id,
-            api_hash=excluded.api_hash,
-            session_string=excluded.session_string,
-            updated_at=excluded.updated_at
-    """, (user_id, slot, api_id, api_hash, session_string))
-    conn.commit(); conn.close()
-
-def sessions_strings(user_id: int | None = None):
-    """Return rows with session_string for worker/login."""
-    conn = get_conn()
-    if user_id is None:
-        rows = conn.execute(
-            "SELECT user_id, slot, api_id, api_hash, session_string "
-            "FROM user_sessions ORDER BY user_id, slot"
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT user_id, slot, api_id, api_hash, session_string "
-            "FROM user_sessions WHERE user_id=? ORDER BY slot",
-            (user_id,)
-        ).fetchall()
-    conn.close()
-    return rows
-
-def session_strings(user_id: int | None = None):  # alias
-    return sessions_strings(user_id)
-
-# ---------- groups ----------
-_GROUPS_CAP = 5
-def groups_cap() -> int: return _GROUPS_CAP
-
-def list_groups(user_id: int) -> List[str]:
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT group_id FROM user_groups WHERE user_id=? ORDER BY added_at",
-        (user_id,)
-    ).fetchall()
-    conn.close(); return [r["group_id"] for r in rows]
-
-def add_group(user_id: int, gid: str) -> int:
-    gid = (gid or "").strip()
-    if not gid: return 0
-    if len(list_groups(user_id)) >= groups_cap(): return 0
-    conn = get_conn()
+async def _notify_rehydrate(user_id: int, slot: int, reason: str):
+    if BOT_NOTIFIER is None: return
+    key = f"authping:{user_id}:{slot}"
+    last = _as_int(get_setting(key, 0), 0)
+    now = _now_ts()
+    if now - last < AUTH_PING_COOLDOWN_SEC:
+        return
+    set_setting(key, now)
+    msg = (
+        "✇ Session issue detected\n"
+        f"✇ Your account (slot {slot}) looks <b>expired or unauthorized</b>.\n"
+        "✇ Please log in again via <b>@SpinifyLoginBot</b>.\n"
+        f"✇ Reason: <code>{reason}</code>"
+    )
     try:
-        conn.execute("INSERT INTO user_groups(user_id, group_id) VALUES(?,?)", (user_id, gid))
-        conn.commit(); return 1
-    except sqlite3.IntegrityError:
+        await BOT_NOTIFIER.send_message(user_id, msg)
+    except Exception:
+        pass
+
+async def resolve_target_chat(app: Client, target: str):
+    """
+    - numeric id -> get_chat(int)
+    - username   -> get_chat('username')  (only if TARGET_NUMERIC_ONLY=0 and input survived normalize)
+    - t.me/username -> by username
+    - invite links (t.me/+… / joinchat/…):
+        * if already member, get_chat(invite) usually works
+        * if not member and NO_AUTO_JOIN, skip
+        * if not member and NO_AUTO_JOIN==False and JOIN_FROM_INVITE==True, try join_chat(invite)
+    """
+    # numeric id
+    if target.lstrip("-").isdigit():
+        try:
+            return await app.get_chat(int(target))
+        except Exception as e:
+            log.info(f"[resolve] id {target} failed: {e}")
+            return None
+
+    # invite links
+    if ALLOW_INVITE_LINKS and is_invite_link(target):
+        try:
+            # if already a member, this often resolves
+            return await app.get_chat(target)
+        except UserNotParticipant:
+            if not NO_AUTO_JOIN and JOIN_FROM_INVITE:
+                try:
+                    chat = await app.join_chat(target)
+                    return chat
+                except Exception as e:
+                    log.info(f"[resolve] join from invite failed: {e}")
+                    return None
+            else:
+                log.info(f"[resolve] invite requires join (NO_AUTO_JOIN): {target}")
+                return None
+        except Exception as e:
+            log.info(f"[resolve] invite get_chat failed: {e}")
+            return None
+
+    # @username / t.me/username (only if not strict numeric-only)
+    m = USERNAME_RE.match(target.lstrip("@"))
+    if m:
+        uname = m.group(1)
+        try:
+            return await app.get_chat(uname)
+        except (UsernameInvalid, UsernameNotOccupied):
+            log.info(f"[resolve] @{uname} invalid/not occupied")
+            return None
+        except Exception as e:
+            log.info(f"[resolve] @{uname} failed: {e}")
+            return None
+
+    if target.startswith("http"):
+        u = extract_username_from_link(target)
+        if u:
+            try:
+                return await app.get_chat(u)
+            except Exception as e:
+                log.info(f"[resolve] link→@{u} failed: {e}")
+                return None
+        log.info(f"[resolve] unsupported link: {target}")
+        return None
+
+    return None
+
+async def _send_via_session(sess: dict, targets: list[str], text: str, parse_mode: str | None) -> int:
+    ok = 0
+    app = Client(
+        name=f"user-{sess['user_id']}-s{sess['slot']}",
+        api_id=int(sess["api_id"]),
+        api_hash=str(sess["api_hash"]),
+        session_string=str(sess["session_string"])
+    )
+    try:
+        await app.start()
+    except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
+        await _notify_rehydrate(sess["user_id"], sess["slot"], e.__class__.__name__)
+        log.error(f"[u{sess['user_id']} s{sess['slot']}] start auth error: {e}")
         return 0
-    finally:
-        conn.close()
+    except Exception as e:
+        log.error(f"[u{sess['user_id']} s{sess['slot']}] start failed: {e}")
+        return 0
 
-def clear_groups(user_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM user_groups WHERE user_id=?", (user_id,))
-    conn.commit(); conn.close()
+    for tgt in targets:
+        chat = await resolve_target_chat(app, tgt)
+        if chat is None:
+            log.info(f"[u{sess['user_id']}] unresolved/unsupported target: {tgt}")
+            continue
 
-def groups_iter_all() -> Iterator[Dict]:
-    conn = get_conn()
-    rows = conn.execute("SELECT user_id, group_id FROM user_groups ORDER BY user_id, added_at").fetchall()
-    conn.close()
-    for r in rows:
-        yield r
+        try:
+            await app.send_message(chat_id=chat.id, text=text, parse_mode=parse_mode)
+            ok += 1
+            log.info(f"[u{sess['user_id']} s{sess['slot']}] sent to {getattr(chat,'username',None) or chat.id}")
+            await asyncio.sleep(0.5)
+        except FloodWait as fw:
+            wait = _as_int(getattr(fw, "value", 30), 30)
+            log.warning(f"[u{sess['user_id']} s{sess['slot']}] FloodWait {wait}s on {getattr(chat,'id',None) or tgt}")
+            await asyncio.sleep(wait + 1)
+        except UserNotParticipant:
+            log.info(f"[u{sess['user_id']}] not a participant in {getattr(chat,'username',None) or chat.id} (NO-JOIN)")
+        except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
+            await _notify_rehydrate(sess["user_id"], sess["slot"], e.__class__.__name__)
+            log.error(f"[u{sess['user_id']} s{sess['slot']}] auth error on send: {e}")
+        except RPCError as e:
+            log.warning(f"[u{sess['user_id']} s{sess['slot']}] RPCError on {chat.id}: {e}")
+        except Exception as e:
+            log.warning(f"[u{sess['user_id']} s{sess['slot']}] send failed on {chat.id}: {e}")
 
-# ---------- intervals ----------
-def set_interval(user_id: int, minutes: int):
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO intervals(user_id, minutes) VALUES(?,?)
-        ON CONFLICT(user_id) DO UPDATE SET minutes=excluded.minutes
-    """, (user_id, minutes))
-    conn.commit(); conn.close()
+    try:
+        await app.stop()
+    except Exception:
+        pass
+    return ok
 
-def get_interval(user_id: int) -> int | None:
-    conn = get_conn()
-    r = conn.execute("SELECT minutes FROM intervals WHERE user_id=?", (user_id,)).fetchone()
-    conn.close(); return (r["minutes"] if r else None)
+def _normalize_groups_in_db_once(user_id: int):
+    key = f"norm:groups:{user_id}"
+    if _as_int(get_setting(key, 0), 0):
+        return
+    original = list_groups(user_id)
+    tokens = normalize_tokens(expand_targets(original))
+    if tokens and (len(tokens) != len(original) or set(tokens) != set(original)):
+        clear_groups(user_id)
+        added = 0
+        for t in tokens:
+            try: added += add_group(user_id, t)
+            except Exception: pass
+        log.info(f"[u{user_id}] normalized groups {len(original)}→{len(tokens)}, added={added}")
+    set_setting(key, 1)
 
-# ---------- settings (KV) ----------
-def _encode_val(val: Any) -> str:
-    if isinstance(val, (int, float)): return str(val)
-    try: return json.dumps(val, ensure_ascii=False)
-    except Exception: return str(val)
+def _consume_sendnow_flag(user_id: int) -> bool:
+    key = f"user:{user_id}:sendnow"
+    v = _as_int(get_setting(key, 0), 0)
+    if v:
+        set_setting(key, 0)
+        return True
+    return False
 
-def _decode_val(s: str) -> Any:
-    if s is None: return None
-    s = str(s)
-    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
-        try: return int(s)
-        except: pass
-    try: return json.loads(s)
-    except Exception: return s
+async def process_user(user_id: int):
+    # respect per-user pause
+    paused = str(get_setting(f"user:{user_id}:paused", 0) or "0").lower() in ("1", "true")
+    if paused:
+        return
 
-def set_setting(key: str, val: Any):
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO settings(key,val) VALUES(?,?)
-        ON CONFLICT(key) DO UPDATE SET val=excluded.val
-    """, (key, _encode_val(val)))
-    conn.commit(); conn.close()
+    if night_enabled() and is_night_now_ist():
+        return
 
-def get_setting(key: str, default: Any=None) -> Any:
-    conn = get_conn()
-    r = conn.execute("SELECT val FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
-    return _decode_val(r["val"]) if r and r.get("val") is not None else default
+    _normalize_groups_in_db_once(user_id)
 
-# ---------- night mode ----------
-def night_enabled() -> bool:
-    return bool(int(get_setting("night:enabled", 0) or 0))
+    text, mode = get_ad(user_id)
+    if not text:
+        log.info(f"[u{user_id}] no ad text set")
+        return
+    groups = list_groups(user_id)
+    if not groups:
+        log.info(f"[u{user_id}] no groups configured")
+        return
+    sessions = sessions_strings(user_id)
+    if not sessions:
+        log.info(f"[u{user_id}] no sessions")
+        return
 
-def set_night_enabled(flag: bool):
-    set_setting("night:enabled", 1 if flag else 0)
+    interval_min = _as_int(get_interval(user_id) or 30, 30)
+    last_ts = get_last_sent_at(user_id)
+    now = _now_ts()
 
-# ---------- gate channels (membership gating) ----------
-def get_gate_channels() -> Tuple[str, str]:
-    ch1 = get_setting("gate:ch1", "") or ""
-    ch2 = get_setting("gate:ch2", "") or ""
-    return (str(ch1), str(ch2))
+    force_now = _consume_sendnow_flag(user_id)
 
-def set_gate_channels(ch1: str | None, ch2: str | None):
-    if ch1 is not None: set_setting("gate:ch1", ch1)
-    if ch2 is not None: set_setting("gate:ch2", ch2)
+    if not force_now and last_ts is not None and now - _as_int(last_ts, 0) < interval_min * 60:
+        remain = interval_min*60 - (now - _as_int(last_ts, 0))
+        log.info(f"[u{user_id}] not due yet ({remain}s left)")
+        return
 
-def get_gate_channels_effective() -> Tuple[str, str]:
-    env1 = (os.getenv("GATE_CHANNEL_1") or "").strip()
-    env2 = (os.getenv("GATE_CHANNEL_2") or "").strip()
-    if env1 or env2:
-        return (env1, env2)
-    return get_gate_channels()
+    idx = _next_slot_index(user_id, len(sessions))
+    sess = sessions[idx]
 
-# ---------- premium name-lock ----------
-def set_name_lock(user_id: int, enabled: bool, name: str | None = None):
-    set_setting(f"user:{user_id}:name_lock", 1 if enabled else 0)
-    if name is not None:
-        set_setting(f"user:{user_id}:locked_name", name)
+    targets = normalize_tokens(expand_targets(groups))
+    if not targets:
+        log.info(f"[u{user_id}] no valid targets after expansion")
+        return
 
-def name_lock_enabled(user_id: int) -> bool:
-    return bool(int(get_setting(f"user:{user_id}:name_lock", 0) or 0))
+    sent = await _send_via_session(sess, targets, text, _parse_mode_string(mode))
+    if sent > 0:
+        mark_sent_now(user_id)
+        inc_sent_ok(user_id, sent)
+        log.info(f"[u{user_id}] sent_ok+={sent}")
+    else:
+        log.info(f"[u{user_id}] nothing sent this tick")
 
-def locked_name(user_id: int) -> str | None:
-    v = get_setting(f"user:{user_id}:locked_name", None)
-    return v if v else None
+async def main_loop():
+    init_db()
+    while True:
+        try:
+            for uid in users_with_sessions():
+                try:
+                    await process_user(uid)
+                except Exception as e:
+                    log.error(f"[u{uid}] process error: {e}")
+                await asyncio.sleep(0.2)
+        except Exception as e:
+            log.error(f"loop error: {e}")
+        await asyncio.sleep(15)
 
-# ---------- ads ----------
-def set_ad(user_id: int, text: str, parse_mode: str | None = None):
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO ads(user_id, text, parse_mode, updated_at)
-        VALUES(?,?,?,strftime('%s','now'))
-        ON CONFLICT(user_id) DO UPDATE SET
-            text=excluded.text,
-            parse_mode=excluded.parse_mode,
-            updated_at=excluded.updated_at
-    """, (user_id, text, (parse_mode or None)))
-    conn.commit(); conn.close()
+async def main():
+    await main_loop()
 
-def get_ad(user_id: int) -> Tuple[str | None, str | None]:
-    conn = get_conn()
-    r = conn.execute("SELECT text, parse_mode FROM ads WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    if not r: return (None, None)
-    return (r["text"], r["parse_mode"])
-
-# ---------- worker state ----------
-def get_last_sent_at(user_id: int) -> int | None:
-    conn = get_conn()
-    r = conn.execute("SELECT last_sent_at FROM worker_state WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    return int(r["last_sent_at"]) if r and r["last_sent_at"] is not None else None
-
-def mark_sent_now(user_id: int):
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO worker_state(user_id, last_sent_at)
-        VALUES(?, strftime('%s','now'))
-        ON CONFLICT(user_id) DO UPDATE SET last_sent_at=excluded.last_sent_at
-    """, (user_id,))
-    conn.commit(); conn.close()
-
-# ---------- helpers for workers ----------
-def users_with_sessions() -> List[int]:
-    conn = get_conn()
-    rows = conn.execute("SELECT DISTINCT user_id FROM user_sessions").fetchall()
-    conn.close(); return [r["user_id"] for r in rows]
-
-# ---------- backward-compat aliases ----------
-def upsert_user(user_id: int, username: str | None):  # alias -> ensure_user
-    return ensure_user(user_id, username)
-
-def count_user_sessions() -> int:  # alias -> sessions_count
-    return sessions_count()
-
-def count_user_sessions_user(user_id: int) -> int:
-    return sessions_count_user(user_id)
-
-def delete_session_slot(user_id: int, slot: int):
-    return sessions_delete(user_id, slot)
-
-def upsert_session_slot(user_id: int, slot: int, api_id: int, api_hash: str, session_string: str):
-    return sessions_upsert_slot(user_id, slot, api_id, api_hash, session_string)
-
-def set_global_night_mode(flag: bool):
-    return set_night_enabled(flag)
-
-# ---------- debug/selftest ----------
-def _selftest_summary():
-    return {
-        "users_count": users_count(),
-        "sessions_users": sessions_count(),
-        "gate_channels": get_gate_channels_effective(),
-        "night_enabled": night_enabled(),
-        "schema_ok": True,
-    }
-
-__all__ = [
-    # core
-    "init_db","get_conn",
-    # users & stats
-    "ensure_user","users_count","all_user_ids","inc_sent_ok","get_total_sent_ok","top_users",
-    # sessions
-    "sessions_list","get_user_sessions_full","sessions_iter_full","sessions_delete",
-    "sessions_count","sessions_count_user","first_free_slot","sessions_upsert_slot",
-    "sessions_strings","session_strings",
-    # groups
-    "groups_cap","list_groups","add_group","clear_groups","groups_iter_all",
-    # intervals
-    "set_interval","get_interval",
-    # settings
-    "set_setting","get_setting",
-    # night mode
-    "night_enabled","set_night_enabled",
-    # gate channels
-    "get_gate_channels","set_gate_channels","get_gate_channels_effective",
-    # premium name lock
-    "set_name_lock","name_lock_enabled","locked_name",
-    # ads
-    "set_ad","get_ad",
-    # worker state
-    "get_last_sent_at","mark_sent_now",
-    # worker helpers
-    "users_with_sessions",
-    # aliases
-    "upsert_user","count_user_sessions","count_user_sessions_user",
-    "delete_session_slot","upsert_session_slot","set_global_night_mode",
-                                        ]
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
