@@ -8,8 +8,9 @@
 # • Disclaimer
 # • Owner-only: Night Mode toggle, Stats, Top 10, Broadcast, Upgrade/Downgrade (name-lock)
 # • Referrals: /ref /refstats /reftop + /start ref_<id>
+# • Pause/Resume forwarding
 
-import os, asyncio, logging
+import os, asyncio, logging, re
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -168,6 +169,8 @@ def kb_main(uid: int) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="⏱ Interval",         callback_data="menu:interval")],
         [InlineKeyboardButton(text="📝 Message",          callback_data="menu:msg")],
         [InlineKeyboardButton(text="ℹ️ Disclaimer",       callback_data="menu:disc")],
+        [InlineKeyboardButton(text="⏸ Pause",            callback_data="menu:pause"),
+         InlineKeyboardButton(text="▶️ Resume",           callback_data="menu:resume")],
     ]
     if is_owner(uid):
         rows.append([InlineKeyboardButton(text=("🌙 Night: ON" if night_enabled() else "🌙 Night: OFF"),
@@ -230,22 +233,21 @@ def kb_msg_modes() -> InlineKeyboardMarkup:
 # -------------- Views --------------
 async def view_home(msg_or_cq, uid: int):
     have_sessions = sessions_count_user(uid) > 0
-    session_line = "✇ Sessions: ✅" if have_sessions else "✇ Sessions: ❌ (Add via @SpinifyLoginBot)"
-    HOWTO = (
-        "✇ How to use\n"
-        "  1) ✇ Open @SpinifyLoginBot and add up to 3 accounts\n"
-        "  2) ✇ Set interval (30/45/60 min)\n"
-        "  3) ✇ Add up to 5 groups\n"
-        "  4) ✇ Set your 📝 Message\n"
-        "  5) ✇ Worker will forward on schedule\n\n"
-        f"{session_line}\n"
-        "✇ Owner can enable Night Mode (00:00–07:00 IST).\n"
-        "✇ Use /ref to get your referral link."
+    gs = list_groups(uid)
+    iv = get_interval(uid) or 30
+    paused = str(get_setting(f"user:{uid}:paused", 0) or "0").lower() in ("1", "true")
+
+    header = (
+        f"✇ Sessions: {'✅' if have_sessions else '❌'}  "
+        f"✇ Groups: {len(gs)}/{groups_cap()}  "
+        f"✇ Interval: {iv}m  "
+        f"✇ {'⏸ Paused' if paused else '▶️ Live'}\n"
+        "— Use the buttons below —"
     )
     if isinstance(msg_or_cq, Message):
-        await msg_or_cq.answer(HOWTO, reply_markup=kb_main(uid))
+        await msg_or_cq.answer(header, reply_markup=kb_main(uid))
     else:
-        await safe_edit_text(msg_or_cq.message, HOWTO, reply_markup=kb_main(uid))
+        await safe_edit_text(msg_or_cq.message, header, reply_markup=kb_main(uid))
 
 async def view_accounts(cq: CallbackQuery):
     uid = cq.from_user.id
@@ -280,7 +282,7 @@ async def view_disclaimer(cq: CallbackQuery):
         "✇ Use at your own risk.\n"
         "✇ If your Telegram ID gets terminated, I am not responsible.\n"
         "✇ You must comply with Telegram’s Terms and local laws.\n"
-        "✇ Excessive spam/abuse may lead to account limitations."
+        "✇ Avoid spam/abuse to reduce blocks and rate limits."
     )
     await safe_edit_text(cq.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]
@@ -355,6 +357,29 @@ async def cb_interval(cq: CallbackQuery):
 async def cb_disc(cq: CallbackQuery):
     await view_disclaimer(cq)
 
+# Pause/Resume
+@dp.callback_query(F.data == "menu:pause")
+async def cb_pause(cq: CallbackQuery):
+    uid = cq.from_user.id
+    set_setting(f"user:{uid}:paused", 1)
+    await view_home(cq, uid)
+
+@dp.callback_query(F.data == "menu:resume")
+async def cb_resume(cq: CallbackQuery):
+    uid = cq.from_user.id
+    set_setting(f"user:{uid}:paused", 0)
+    await view_home(cq, uid)
+
+@dp.message(Command("pause"))
+async def cmd_pause(msg: Message):
+    set_setting(f"user:{msg.from_user.id}:paused", 1)
+    await msg.answer("⏸ Forwarding paused. Tap /start to open the panel.")
+
+@dp.message(Command("resume"))
+async def cmd_resume(msg: Message):
+    set_setting(f"user:{msg.from_user.id}:paused", 0)
+    await msg.answer("▶️ Forwarding resumed. Tap /start to open the panel.")
+
 # Accounts delete slot
 @dp.callback_query(F.data.startswith("acct:del:"))
 async def cb_acct_del(cq: CallbackQuery):
@@ -370,24 +395,32 @@ async def cb_acct_del(cq: CallbackQuery):
 @dp.callback_query(F.data == "groups:add")
 async def cb_groups_add(cq: CallbackQuery, state: FSMContext):
     await state.set_state(G.adding)
-    await safe_edit_text(cq.message, "✇ Send a group username or invite link (e.g., @MyGroup or https://t.me/xyz)")
+    await safe_edit_text(cq.message, "✇ Send a group numeric ID or invite link (e.g., -100123..., https://t.me/+xxxx)")
 
 @dp.message(G.adding)
 async def on_group_text(msg: Message, state: FSMContext):
     uid = msg.from_user.id
-    try:
-        n = add_group(uid, msg.text)
-        if n:
-            await msg.answer("✅ Added.")
-        else:
-            await msg.answer("ℹ️ No slot available or already added (max 5).")
-    except Exception as e:
-        await msg.answer(f"❌ Failed: <code>{e}</code>")
+    # accept multiple separated by space/comma/newlines
+    tokens = re.split(r"[,\s]+", (msg.text or "").strip())
+    added_total = 0
+    for t in tokens:
+        t = t.strip().rstrip("/.,")
+        if not t:
+            continue
+        try:
+            added_total += add_group(uid, t)
+        except Exception:
+            pass
+    if added_total:
+        await msg.answer(f"✅ Added {added_total}.")
+    else:
+        await msg.answer("ℹ️ No slot available or duplicates (max 5).")
     await state.clear()
-    # back to groups view
-    gs = list_groups(uid)
-    text = ("👥 Groups (max {cap})\n".format(cap=groups_cap()) + "\n".join(f"• {g}" for g in gs)) if gs else f"👥 Groups (max {groups_cap()})\n✇ No groups yet. Add one."
-    await msg.answer(text, reply_markup=kb_groups(uid))
+    await msg.answer(
+        ("👥 Groups (max {cap})\n".format(cap=groups_cap()) + "\n".join(f"• {g}" for g in list_groups(uid)))
+        if list_groups(uid) else f"👥 Groups (max {groups_cap()})\n✇ No groups yet. Add one.",
+        reply_markup=kb_groups(uid)
+    )
 
 @dp.callback_query(F.data == "groups:clear")
 async def cb_groups_clear(cq: CallbackQuery):
@@ -420,9 +453,12 @@ async def menu_msg(cq: CallbackQuery):
         reply_markup=kb_msg_menu()
     )
 
+class MsgSetFlow(StatesGroup):
+    text = State()
+
 @dp.callback_query(F.data == "msg:set")
 async def msg_set(cq: CallbackQuery, state: FSMContext):
-    await state.set_state(MsgFlow.text)
+    await state.set_state(MsgSetFlow.text)
     await safe_edit_text(
         cq.message,
         "✇ Send the message text now (next message).\n"
@@ -430,7 +466,7 @@ async def msg_set(cq: CallbackQuery, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Cancel", callback_data="menu:msg")]])
     )
 
-@dp.message(MsgFlow.text)
+@dp.message(MsgSetFlow.text)
 async def msg_text_save(msg: Message, state: FSMContext):
     await state.update_data(pending_text=msg.text)
     await msg.answer("✇ Choose parse mode:", reply_markup=kb_msg_modes())
@@ -527,7 +563,11 @@ async def on_broadcast_text(msg: Message, state: FSMContext):
 @dp.callback_query(F.data == "owner:upgrade")
 async def cb_owner_upgrade_menu(cq: CallbackQuery):
     if not is_owner(cq.from_user.id): return
-    await safe_edit_text(cq.message, "💎 Premium Controls", reply_markup=kb_owner_upgrade_menu())
+    await safe_edit_text(cq.message, "💎 Premium Controls", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Upgrade",   callback_data="owner:upgrade:do")],
+        [InlineKeyboardButton(text="🧹 Downgrade", callback_data="owner:downgrade:do")],
+        [InlineKeyboardButton(text="⬅ Back",      callback_data="menu:home")]
+    ]))
 
 @dp.callback_query(F.data == "owner:upgrade:do")
 async def cb_owner_upgrade_do(cq: CallbackQuery, state: FSMContext):
