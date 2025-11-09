@@ -1,22 +1,20 @@
-# main_bot.py — compact iOS-style UI (Aiogram v3.x)
+# main_bot.py — Aiogram v3.x (compact iOS-style UI)
 # Features:
-# • Gate on /start (defaults: @PhiloBots, @TheTrafficZone) — set via REQUIRED_CHANNELS CSV
-# • Start/Pause toggle + /pause /resume
-# • /fstats shows next send ETA (hh:mm:ss), sessions, groups, night-mode state
+# • Channel gate (@PhiloBots, @TheTrafficZone defaults)
+# • Accounts (remove slot; add via @SpinifyLoginBot)
+# • Groups (accept any links/IDs; remind to join manually; max 5 by default)
+# • Unlock Gc → raise cap to 10 if user joined UNLOCK_GC_CHAT_ID
 # • Intervals: 30/45/60 minutes
-# • Groups: save ANY handle/ID/link (no validation); private invites require you to join manually
-# • Unlock 10 groups if user joins UNLOCK_GC_USERNAME (env)
-# • “Saved → PINNED” ad flow (worker forwards pinned message from each session)
-# • Owner: Night toggle, Stats, Top 10 (UI + /stats /top)
-# • Referrals: /ref /refstats /reftop + start payload ref_<id>
+# • Message flow = instructions only (worker sends pinned message from Saved Messages)
+# • Pause/Resume + /fstats with next-send countdown
+# • Disclaimer
+# • Owner-only: Night Mode toggle, Stats, Top 10, Broadcast, Upgrade/Downgrade (name-lock)
+# • Referrals: /ref /refstats /reftop + /start ref_<id>
 
-import os, asyncio, logging
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
-
+import os, asyncio, logging, math
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.state import StatesGroup, State
@@ -25,24 +23,36 @@ from dotenv import load_dotenv
 
 from core.db import (
     init_db, ensure_user, get_conn,
+    # sessions
     sessions_list, sessions_delete, sessions_count, sessions_count_user,
+    # groups & interval
     list_groups, add_group, clear_groups,
-    set_interval, get_interval,
+    set_interval, get_interval, get_last_sent_at,
+    # stats
     get_total_sent_ok, users_count, top_users,
+    # night mode
     night_enabled, set_night_enabled,
+    # KV/settings
     set_setting, get_setting,
-    get_last_sent_at,
+    # premium name-lock
+    set_name_lock,
 )
 
 # ---------------- ENV / BOOT ----------------
 load_dotenv()
 TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-UNLOCK_GC_USERNAME = os.getenv("UNLOCK_GC_USERNAME", "").strip()  # e.g. @YourPremiumGC
-REQUIRED_CHANNELS = [c.strip() for c in os.getenv("REQUIRED_CHANNELS", "@PhiloBots,@TheTrafficZone").split(",") if c.strip()]
-
 if not TOKEN or ":" not in TOKEN:
     raise RuntimeError("MAIN_BOT_TOKEN missing/malformed.")
+
+# Unlock Gc config:
+# UNLOCK_GC_LINK: t.me/xxx or invite link (used for button)
+# UNLOCK_GC_CHAT_ID: numeric chat id to verify membership (required for hard verification)
+UNLOCK_GC_LINK = os.getenv("UNLOCK_GC_LINK", "").strip()
+try:
+    UNLOCK_GC_CHAT_ID = int(os.getenv("UNLOCK_GC_CHAT_ID", "0"))
+except Exception:
+    UNLOCK_GC_CHAT_ID = 0
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -51,79 +61,38 @@ init_db()
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 log = logging.getLogger("main_bot")
 
-IST = ZoneInfo("Asia/Kolkata")
-NIGHT_START = time(0, 0)
-NIGHT_END   = time(7, 0)
+BOT_USERNAME = None  # cached after first /start
 
-BOT_USERNAME = None  # lazy-cached for /ref link
+# ---------------- Gate helpers ----------------
+def _defaults_gate_if_empty(chs: list[str]) -> list[str]:
+    return chs or ["@PhiloBots", "@TheTrafficZone"]
 
-# -------------- Helpers --------------
-def is_owner(uid: int) -> bool:
-    return OWNER_ID and int(uid) == OWNER_ID
+def _gate_channels() -> list[str]:
+    ch1 = os.getenv("GATE_CH1", "").strip()
+    ch2 = os.getenv("GATE_CH2", "").strip()
+    chs = [c for c in (ch1, ch2) if c]
+    return _defaults_gate_if_empty(chs)
 
-async def safe_edit_text(message, text, **kw):
-    try:
-        return await message.edit_text(text, **kw)
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e).lower():
-            return None
-        raise
-
-async def _is_member(chat: str, user_id: int) -> bool:
-    if not chat: return False
-    try:
-        m = await bot.get_chat_member(chat, user_id)
-        st = str(getattr(m, "status", "left")).lower()
-        return st not in {"left", "kicked"}
-    except Exception:
-        return False
-
-async def groups_cap_for(uid: int) -> int:
-    # Default 5; unlock 10 if member of UNLOCK_GC_USERNAME
-    if UNLOCK_GC_USERNAME and await _is_member(UNLOCK_GC_USERNAME, uid):
-        return 10
-    return 5
-
-def _is_paused(uid: int) -> bool:
-    v = str(get_setting(f"user:{uid}:paused", "0")).lower()
-    return v in ("1","true","yes","on")
-
-def _set_paused(uid: int, on: bool):
-    set_setting(f"user:{uid}:paused", "1" if on else "0")
-
-def _is_night_now_ist() -> bool:
-    now = datetime.now(IST).time()
-    return NIGHT_START <= now < NIGHT_END
-
-def _next_7am_ist_from(now_ist: datetime) -> datetime:
-    target = now_ist.replace(hour=7, minute=0, second=0, microsecond=0)
-    if now_ist.time() >= NIGHT_END:
-        return target + timedelta(days=1)
-    return target
-
-def _fmt_hms(sec: int) -> str:
-    sec = max(0, int(sec))
-    m, s = divmod(sec, 60)
-    h, m = divmod(m, 60)
-    if h: return f"{h}h {m}m {s}s"
-    if m: return f"{m}m {s}s"
-    return f"{s}s"
-
-# -------------- Gate (required channels on /start) --------------
-async def _gate_ok(uid: int):
+async def _check_gate(user_id: int):
     missing = []
-    for ch in REQUIRED_CHANNELS:
-        if not await _is_member(ch, uid):
+    for ch in _gate_channels():
+        try:
+            m = await bot.get_chat_member(ch, user_id)
+            if str(getattr(m, "status", "left")).lower() in {"left","kicked"}:
+                missing.append(ch)
+        except Exception:
             missing.append(ch)
-    return (len(missing) == 0), missing
+    return (len(missing)==0), missing
 
-def _gate_kb(missing: list[str]):
-    rows = [[InlineKeyboardButton(text=f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")] for ch in missing]
+def _gate_kb():
+    rows = []
+    for ch in _gate_channels():
+        rows.append([InlineKeyboardButton(text=f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")])
     rows.append([InlineKeyboardButton(text="✅ I've Joined", callback_data="gate:check")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def _gate_text(missing: list[str]) -> str:
-    lines = "\n".join(f"  • {ch}" for ch in missing)
+def _gate_text() -> str:
+    lines = "\n".join(f"  • {ch}" for ch in _gate_channels())
     return (
         "✇ Access required\n"
         "✇ Join the channels below to use the bot:\n"
@@ -131,6 +100,33 @@ def _gate_text(missing: list[str]) -> str:
         "✇ After joining, tap <b>I've Joined</b>."
     )
 
+# ---------------- Pause helpers ----------------
+def _pause_key(uid:int) -> str:
+    return f"user:paused:{uid}"
+
+def _is_paused(uid: int) -> bool:
+    val = get_setting(_pause_key(uid), 0)
+    try:
+        return bool(int(val))
+    except Exception:
+        return str(val).lower() in {"1","true","yes","on"}
+
+def _set_paused(uid: int, v: bool):
+    set_setting(_pause_key(uid), 1 if v else 0)
+
+# ---------------- Groups cap helpers ----------------
+def _groups_cap(uid: int) -> int:
+    # default 5; if unlocked → 10
+    raw = get_setting(f"groups_cap:{uid}", None)
+    try:
+        return int(raw) if raw is not None else 5
+    except Exception:
+        return 5
+
+def _set_groups_cap(uid: int, cap: int):
+    set_setting(f"groups_cap:{uid}", int(cap))
+
+# ---------------- Middlewares ----------------
 class AutoAckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if isinstance(event, CallbackQuery):
@@ -139,7 +135,7 @@ class AutoAckMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 class GateGuardMiddleware(BaseMiddleware):
-    """Block everything except /start and gate:* until joined REQUIRED_CHANNELS."""
+    """Block everything except /start and gate:* until joined channels."""
     async def __call__(self, handler, event, data):
         uid = getattr(getattr(event, "from_user", None), "id", None)
         allow = False
@@ -147,29 +143,29 @@ class GateGuardMiddleware(BaseMiddleware):
             allow = True
         if isinstance(event, CallbackQuery) and (event.data or "").startswith("gate:"):
             allow = True
-        if allow or not uid:
+        if allow or not _gate_channels() or not uid:
             return await handler(event, data)
-        ok, miss = await _gate_ok(uid)
+        ok, _ = await _check_gate(uid)
         if ok:
             return await handler(event, data)
-        # Show gate
+        # show gate prompt
         if isinstance(event, CallbackQuery):
             try:
-                await safe_edit_text(event.message, _gate_text(miss), reply_markup=_gate_kb(miss))
+                await event.message.edit_text(_gate_text(), reply_markup=_gate_kb())
             except Exception:
-                await bot.send_message(uid, _gate_text(miss), reply_markup=_gate_kb(miss))
+                await bot.send_message(uid, _gate_text(), reply_markup=_gate_kb())
         else:
-            await bot.send_message(uid, _gate_text(miss), reply_markup=_gate_kb(miss))
+            await bot.send_message(uid, _gate_text(), reply_markup=_gate_kb())
         return
 
 dp.update.middleware(AutoAckMiddleware())
 dp.update.middleware(GateGuardMiddleware())
 
-# -------------- Referrals --------------
-def _ref_key_by(user_id: int) -> str:      # who referred this user
+# ---------------- Referrals ----------------
+def _ref_key_by(user_id: int) -> str:  # who referred this user
     return f"ref:by:{user_id}"
 
-def _ref_key_count(user_id: int) -> str:   # how many this user referred
+def _ref_key_count(user_id: int) -> str:  # how many this user referred
     return f"ref:count:{user_id}"
 
 def _ref_set_if_absent(user_id: int, referrer_id: int) -> bool:
@@ -188,40 +184,36 @@ async def _ensure_bot_username():
         me = await bot.get_me()
         BOT_USERNAME = me.username
 
-# -------------- Keyboards --------------
+# ---------------- Keyboards ----------------
 def kb_main(uid: int) -> InlineKeyboardMarkup:
-    paused = _is_paused(uid)
     rows = [
-        [InlineKeyboardButton(text=("▶️ Start" if paused else "⏸ Pause"), callback_data="user:togglepause"),
-         InlineKeyboardButton(text="📟 Forward Stats", callback_data="menu:fstats")],
         [InlineKeyboardButton(text="👤 Manage Accounts", callback_data="menu:accounts")],
         [InlineKeyboardButton(text="👥 Groups",           callback_data="menu:groups"),
          InlineKeyboardButton(text="⏱ Interval",         callback_data="menu:interval")],
-        [InlineKeyboardButton(text="📝 Set Message (PINNED)", callback_data="menu:msginfo")],
+        [InlineKeyboardButton(text="📝 Message",          callback_data="menu:msg")],
+        [InlineKeyboardButton(text="🔓 Unlock Gc",        callback_data="groups:unlock")],
+        [InlineKeyboardButton(text=("⏸ Pause" if not _is_paused(uid) else "▶️ Resume"),
+                              callback_data="user:pause:toggle")],
         [InlineKeyboardButton(text="ℹ️ Disclaimer",       callback_data="menu:disc")],
     ]
-    if is_owner(uid):
+    if OWNER_ID and uid == OWNER_ID:
         rows.append([InlineKeyboardButton(text=("🌙 Night: ON" if night_enabled() else "🌙 Night: OFF"),
                                           callback_data="owner:night:toggle")])
         rows.append([InlineKeyboardButton(text="📊 Stats", callback_data="owner:stats"),
                      InlineKeyboardButton(text="🏆 Top 10", callback_data="owner:top")])
+        rows.append([InlineKeyboardButton(text="📣 Broadcast", callback_data="owner:broadcast"),
+                     InlineKeyboardButton(text="💎 Upgrade/Downgrade", callback_data="owner:upgrade")])
     rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_groups(uid: int, cap: int, unlocked: bool) -> InlineKeyboardMarkup:
-    kb = [
+def kb_groups(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Add Group", callback_data="groups:add"),
          InlineKeyboardButton(text="🧹 Clear",     callback_data="groups:clear")],
-    ]
-    if UNLOCK_GC_USERNAME:
-        label = "🔓 Unlock 10 Groups" if not unlocked else "✅ 10 Groups Unlocked"
-        row = [InlineKeyboardButton(text=label, url=f"https://t.me/{UNLOCK_GC_USERNAME.lstrip('@')}")]
-        if not unlocked:
-            row.append(InlineKeyboardButton(text="✅ I've Joined", callback_data="unlock:check"))
-        kb.append(row)
-    kb.append([InlineKeyboardButton(text="🔄 Refresh",   callback_data="menu:groups"),
-               InlineKeyboardButton(text="⬅ Back",       callback_data="menu:home")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+        [InlineKeyboardButton(text="🔓 Unlock Gc", callback_data="groups:unlock")],
+        [InlineKeyboardButton(text="🔄 Refresh",   callback_data="menu:groups"),
+         InlineKeyboardButton(text="⬅ Back",       callback_data="menu:home")],
+    ])
 
 def kb_intervals(cur: int|None) -> InlineKeyboardMarkup:
     def chip(v):
@@ -232,30 +224,51 @@ def kb_intervals(cur: int|None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]
     ])
 
-def kb_msg_info() -> InlineKeyboardMarkup:
+def kb_msg_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ I’ve pinned my ad", callback_data="msg:saved-confirm")],
+        [InlineKeyboardButton(text="📖 How it works", callback_data="msg:howto"),
+         InlineKeyboardButton(text="👁 Preview Tip",  callback_data="msg:previewtip")],
         [InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]
     ])
 
-# -------------- Views --------------
+def kb_owner_upgrade_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Upgrade",   callback_data="owner:upgrade:do")],
+        [InlineKeyboardButton(text="🧹 Downgrade", callback_data="owner:downgrade:do")],
+        [InlineKeyboardButton(text="⬅ Back",      callback_data="menu:home")]
+    ])
+
+def kb_unlock_gc():
+    rows = []
+    if UNLOCK_GC_LINK:
+        rows.append([InlineKeyboardButton(text="🔗 Join Unlock GC", url=UNLOCK_GC_LINK)])
+    rows.append([InlineKeyboardButton(text="✅ I've Joined", callback_data="groups:unlock:check")])
+    rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="menu:groups")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# ---------------- Views ----------------
 async def view_home(msg_or_cq, uid: int):
     have_sessions = sessions_count_user(uid) > 0
     session_line = "✇ Sessions: ✅" if have_sessions else "✇ Sessions: ❌ (Add via @SpinifyLoginBot)"
     HOWTO = (
-        "✇ How it works\n"
-        "  1) Login accounts in @SpinifyLoginBot (up to 3)\n"
-        "  2) Add groups (ANY handle/ID/link). We just save it.\n"
-        "  3) Set interval 30/45/60 minutes\n"
-        "  4) In Saved Messages, send your ad and PIN it\n"
-        "  5) Press ▶ Start to begin forwarding\n\n"
+        "✇ How to use\n"
+        "  1) ✇ Open @SpinifyLoginBot and add up to 3 accounts\n"
+        "  2) ✇ Set interval (30/45/60 min)\n"
+        "  3) ✇ Add up to {cap} groups (any link/ID; join them manually)\n"
+        "  4) ✇ In each account: save your ad in Saved Messages and PIN it\n"
+        "  5) ✇ Worker forwards pinned ad on schedule\n\n"
         f"{session_line}\n"
-        "✇ Private invites require YOU to join with the sender account(s) first."
-    )
+        "✇ Owner can enable Night Mode (00:00–07:00 IST).\n"
+        "✇ Use /fstats for next send. Use /ref for referral link."
+    ).format(cap=_groups_cap(uid))
     if isinstance(msg_or_cq, Message):
         await msg_or_cq.answer(HOWTO, reply_markup=kb_main(uid))
     else:
-        await safe_edit_text(msg_or_cq.message, HOWTO, reply_markup=kb_main(uid))
+        try:
+            await msg_or_cq.message.edit_text(HOWTO, reply_markup=kb_main(uid))
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
 
 async def view_accounts(cq: CallbackQuery):
     uid = cq.from_user.id
@@ -267,102 +280,62 @@ async def view_accounts(cq: CallbackQuery):
     else:
         lines = [f"• Slot {r['slot']} — API_ID {r['api_id']}" for r in slots]
         text = "👤 Manage Accounts\n" + "\n".join(lines)
-    kb = [
-        ([InlineKeyboardButton(text=f"🗑 Remove S{s['slot']}", callback_data=f"acct:del:{s['slot']}") for s in slots]
-         if slots else [InlineKeyboardButton(text="➕ Add via @SpinifyLoginBot", url="https://t.me/SpinifyLoginBot")]),
-        [InlineKeyboardButton(text="🔄 Refresh", callback_data="menu:accounts"),
-         InlineKeyboardButton(text="⬅ Back",   callback_data="menu:home")]
-    ]
-    await safe_edit_text(cq.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cq.message.edit_text(text, reply_markup=_kb_accounts(slots))
+
+def _kb_accounts(slots):
+    row1 = [InlineKeyboardButton(text=f"🗑 Remove S{s['slot']}", callback_data=f"acct:del:{s['slot']}") for s in slots]
+    if not row1:
+        row1 = [InlineKeyboardButton(text="➕ Add via @SpinifyLoginBot", url="https://t.me/SpinifyLoginBot")]
+    rows = [row1]
+    rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="menu:accounts"),
+                 InlineKeyboardButton(text="⬅ Back",   callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def view_groups(cq: CallbackQuery):
     uid = cq.from_user.id
     gs = list_groups(uid)
-    cap = await groups_cap_for(uid)
-    unlocked = (cap >= 10)
     if gs:
-        text = f"👥 Groups (max {cap})\n" + "\n".join(f"• {g}" for g in gs)
+        text = f"👥 Groups (max {_groups_cap(uid)})\n" + "\n".join(f"• {g}" for g in gs)
     else:
-        text = f"👥 Groups (max {cap})\n✇ No groups yet. Add one."
-    await safe_edit_text(cq.message, text, reply_markup=kb_groups(uid, cap, unlocked))
+        text = f"👥 Groups (max {_groups_cap(uid)})\n✇ No groups yet. Add one."
+    await cq.message.edit_text(text, reply_markup=kb_groups(uid))
 
 async def view_interval(cq: CallbackQuery):
     uid = cq.from_user.id
     cur = get_interval(uid)
     text = "⏱ Interval\n✇ Choose how often to forward:"
-    await safe_edit_text(cq.message, text, reply_markup=kb_intervals(cur))
+    await cq.message.edit_text(text, reply_markup=kb_intervals(cur))
 
 async def view_disclaimer(cq: CallbackQuery):
     text = (
         "⚠️ Disclaimer (Free Version)\n"
         "✇ Use at your own risk.\n"
-        "✇ If your Telegram account is limited/terminated, we are not responsible.\n"
-        "✇ Follow Telegram terms and local laws. Avoid spam/abuse."
+        "✇ If your Telegram ID gets terminated, I am not responsible.\n"
+        "✇ You must comply with Telegram’s Terms and local laws.\n"
+        "✇ Excessive spam/abuse may lead to account limitations."
     )
-    await safe_edit_text(cq.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]
     ]))
 
-async def view_msg_info(cq: CallbackQuery):
-    txt = (
-        "📝 Set Message (Saved → PINNED)\n"
-        "✇ Open your Telegram account (sender).\n"
-        "✇ Go to <b>Saved Messages</b>.\n"
-        "✇ Send your ad text OR media+caption (premium emoji OK).\n"
-        "✇ <b>PIN</b> that message. The worker forwards EXACTLY this.\n\n"
-        "✇ After you pin, tap “I’ve pinned my ad”."
-    )
-    await safe_edit_text(cq.message, txt, reply_markup=kb_msg_info())
-
-# -------------- FSM --------------
+# ---------------- FSM ----------------
 class G(StatesGroup):
     adding = State()
 
-# -------------- Forward Stats --------------
-def _forward_stats_text(uid: int) -> str:
-    paused = _is_paused(uid)
-    interval = get_interval(uid) or 30
-    last = get_last_sent_at(uid)
-    now = int(datetime.utcnow().timestamp())
+class OwnerFlow(StatesGroup):
+    broadcast = State()
+    upgrade_user = State()
+    upgrade_name = State()
+    downgrade_user = State()
 
-    # Night mode
-    if night_enabled() and _is_night_now_ist():
-        now_ist = datetime.now(IST)
-        nxt = _next_7am_ist_from(now_ist)
-        wait = int((nxt - now_ist).total_seconds())
-        nm = f"🌙 Night Mode ON — resumes at 07:00 IST (~{_fmt_hms(wait)})"
-    else:
-        nm = "🌙 Night Mode OFF"
-
-    if paused:
-        status = "⏸ Worker: PAUSED"
-        next_txt = "—"
-    else:
-        status = "▶️ Worker: RUNNING"
-        if last is None:
-            next_txt = "Due now"
-        else:
-            remain = interval*60 - (now - int(last))
-            next_txt = "Due now" if remain <= 0 else f"in ~{_fmt_hms(remain)}"
-
-    ses = sessions_count_user(uid)
-    gs  = len(list_groups(uid))
-    return (
-        "📟 Forward Stats\n"
-        f"✇ {status}\n"
-        f"✇ Interval: {interval} min\n"
-        f"✇ Sessions: {ses}  |  Groups: {gs}\n"
-        f"✇ Next send: {next_txt}\n"
-        f"{nm}"
-    )
-
-# -------------- Handlers --------------
+# ---------------- Handlers ----------------
 @dp.message(Command("start"))
 async def on_start(msg: Message):
+    global BOT_USERNAME
     uid = msg.from_user.id
     ensure_user(uid, getattr(msg.from_user, "username", None))
 
-    # capture referral payload: /start ref_<id>
+    # Referral capture
     try:
         parts = msg.text.split(maxsplit=1)
         if len(parts) == 2 and parts[1].startswith("ref_"):
@@ -373,33 +346,27 @@ async def on_start(msg: Message):
     except Exception:
         pass
 
-    ok, miss = await _gate_ok(uid)
-    if not ok:
-        await msg.answer(_gate_text(miss), reply_markup=_gate_kb(miss))
-        return
+    if not BOT_USERNAME:
+        await _ensure_bot_username()
+
+    # Gate first
+    if _gate_channels():
+        ok, _ = await _check_gate(uid)
+        if not ok:
+            await msg.answer(_gate_text(), reply_markup=_gate_kb()); return
+
     await view_home(msg, uid)
 
 @dp.callback_query(F.data == "gate:check")
 async def on_gate_check(cq: CallbackQuery):
     uid = cq.from_user.id
-    ok, miss = await _gate_ok(uid)
+    ok, _ = await _check_gate(uid)
     if ok: await view_home(cq, uid)
-    else:  await safe_edit_text(cq.message, _gate_text(miss), reply_markup=_gate_kb(miss))
+    else:  await cq.message.edit_text(_gate_text(), reply_markup=_gate_kb())
 
 @dp.callback_query(F.data == "menu:home")
 async def cb_home(cq: CallbackQuery):
     await view_home(cq, cq.from_user.id)
-
-@dp.callback_query(F.data == "menu:fstats")
-async def cb_fstats(cq: CallbackQuery):
-    uid = cq.from_user.id
-    await safe_edit_text(cq.message, _forward_stats_text(uid), reply_markup=kb_main(uid))
-
-@dp.callback_query(F.data == "user:togglepause")
-async def cb_toggle_pause(cq: CallbackQuery):
-    uid = cq.from_user.id
-    _set_paused(uid, not _is_paused(uid))
-    await view_home(cq, uid)
 
 @dp.callback_query(F.data == "menu:accounts")
 async def cb_accounts(cq: CallbackQuery):
@@ -417,9 +384,12 @@ async def cb_interval(cq: CallbackQuery):
 async def cb_disc(cq: CallbackQuery):
     await view_disclaimer(cq)
 
-@dp.callback_query(F.data == "menu:msginfo")
-async def cb_msginfo(cq: CallbackQuery):
-    await view_msg_info(cq)
+# Pause toggle
+@dp.callback_query(F.data == "user:pause:toggle")
+async def cb_pause_toggle(cq: CallbackQuery):
+    uid = cq.from_user.id
+    _set_paused(uid, not _is_paused(uid))
+    await view_home(cq, uid)
 
 # Accounts delete slot
 @dp.callback_query(F.data.startswith("acct:del:"))
@@ -435,61 +405,74 @@ async def cb_acct_del(cq: CallbackQuery):
 # Groups add / clear
 @dp.callback_query(F.data == "groups:add")
 async def cb_groups_add(cq: CallbackQuery, state: FSMContext):
-    cap = await groups_cap_for(cq.from_user.id)
-    gs = list_groups(cq.from_user.id)
-    if len(gs) >= cap:
-        await safe_edit_text(cq.message, f"👥 Groups (max {cap})\n✇ Limit reached. Unlock 10 groups to add more.",
-                             reply_markup=kb_groups(cq.from_user.id, cap, cap>=10))
-        return
     await state.set_state(G.adding)
-    await safe_edit_text(cq.message,
-        "✇ Send ANY group reference to save (we do not validate):\n"
-        "• @username  |  numeric ID  |  https://t.me/username  |  private invite link\n\n"
-        "⚠️ <b>Reminder</b>: Private links require you to JOIN the group with your sender account(s)."
+    cap = _groups_cap(cq.from_user.id)
+    await cq.message.edit_text(
+        "✇ Send a group link/username/numeric ID (public or private invite). I only save it for forwarding.\n"
+        "✇ Reminder: join those groups manually with your account.\n"
+        f"✇ Limit: {cap} entries.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅ Cancel", callback_data="menu:groups")]
+        ])
     )
 
-@dp.message(StateFilter(G.adding))
+@dp.message(G.adding)
 async def on_group_text(msg: Message, state: FSMContext):
     uid = msg.from_user.id
-    cap = await groups_cap_for(uid)
-    gs = list_groups(uid)
-    if len(gs) >= cap:
-        await state.clear()
-        await msg.answer(f"👥 Groups (max {cap})\n✇ Limit reached.")
-        return
-    value = (msg.text or "").strip()
     try:
-        added = add_group(uid, value)
-        if added:
-            await msg.answer(
-                "✅ Saved.\n"
-                "⚠️ If this is a private invite, you must manually join with the sending account."
-            )
+        n = add_group(uid, msg.text)
+        if n:
+            await msg.answer("✅ Added.")
         else:
-            await msg.answer("ℹ️ Already saved (or empty).")
+            await msg.answer(f"ℹ️ No slot available or already added (max {_groups_cap(uid)}).")
     except Exception as e:
         await msg.answer(f"❌ Failed: <code>{e}</code>")
     await state.clear()
-    gs2 = list_groups(uid)
-    cap2 = await groups_cap_for(uid)
-    unlocked = (cap2 >= 10)
-    text = (f"👥 Groups (max {cap2})\n" + "\n".join(f"• {g}" for g in gs2)) if gs2 else f"👥 Groups (max {cap2})\n✇ No groups yet. Add one."
-    await msg.answer(text, reply_markup=kb_groups(uid, cap2, unlocked))
+    # back to groups view
+    gs = list_groups(uid)
+    text = (f"👥 Groups (max {_groups_cap(uid)})\n" + "\n".join(f"• {g}" for g in gs)) if gs else f"👥 Groups (max {_groups_cap(uid)})\n✇ No groups yet. Add one."
+    await msg.answer(text, reply_markup=kb_groups(uid))
 
 @dp.callback_query(F.data == "groups:clear")
 async def cb_groups_clear(cq: CallbackQuery):
     clear_groups(cq.from_user.id)
     await view_groups(cq)
 
-# Unlock 10 groups verify
-@dp.callback_query(F.data == "unlock:check")
-async def cb_unlock_check(cq: CallbackQuery):
+# Unlock Gc flow
+@dp.callback_query(F.data == "groups:unlock")
+async def cb_groups_unlock(cq: CallbackQuery):
     uid = cq.from_user.id
-    cap = await groups_cap_for(uid)
-    unlocked = (cap >= 10)
-    gs = list_groups(uid)
-    text = (f"👥 Groups (max {cap})\n" + "\n".join(f"• {g}" for g in gs)) if gs else f"👥 Groups (max {cap})\n✇ No groups yet. Add one."
-    await safe_edit_text(cq.message, text, reply_markup=kb_groups(uid, cap, unlocked))
+    cap = _groups_cap(uid)
+    if cap >= 10:
+        await cq.message.edit_text("🔓 Unlock Gc\n✇ You already have 10 slots.", reply_markup=kb_groups(uid))
+        return
+    txt = (
+        "🔓 Unlock Gc\n"
+        "✇ Join the special group to unlock 10 groups.\n"
+        "✇ After joining, tap “I've Joined”."
+    )
+    await cq.message.edit_text(txt, reply_markup=kb_unlock_gc())
+
+@dp.callback_query(F.data == "groups:unlock:check")
+async def cb_groups_unlock_check(cq: CallbackQuery):
+    uid = cq.from_user.id
+    if UNLOCK_GC_CHAT_ID == 0:
+        # Soft-unlock fallback if no chat ID configured
+        _set_groups_cap(uid, 10)
+        await cq.message.edit_text("✅ Unlocked! You can now add up to 10 groups.", reply_markup=kb_groups(uid))
+        return
+    try:
+        m = await bot.get_chat_member(UNLOCK_GC_CHAT_ID, uid)
+        if str(getattr(m, "status", "left")).lower() in {"left","kicked"}:
+            raise RuntimeError("not joined")
+        _set_groups_cap(uid, 10)
+        await cq.message.edit_text("✅ Unlocked! You can now add up to 10 groups.", reply_markup=kb_groups(uid))
+    except Exception:
+        await cq.message.edit_text(
+            "❌ I could not verify your membership in the unlock group.\n"
+            "✇ Join using the button, then tap “I've Joined”.",
+            reply_markup=kb_unlock_gc()
+        )
 
 # Interval set
 @dp.callback_query(F.data.startswith("interval:set:"))
@@ -497,63 +480,181 @@ async def cb_set_interval(cq: CallbackQuery):
     uid = cq.from_user.id
     mins = int(cq.data.split(":")[-1])
     if mins not in (30,45,60):
-        await safe_edit_text(cq.message, "❌ Allowed: 30, 45, 60 minutes", reply_markup=kb_intervals(get_interval(uid))); return
+        await cq.message.edit_text("❌ Allowed: 30, 45, 60 minutes", reply_markup=kb_intervals(get_interval(uid))); return
     set_interval(uid, mins)
-    await safe_edit_text(cq.message, f"⏱ Interval set to {mins} minutes ✅", reply_markup=kb_intervals(mins))
+    await cq.message.edit_text(f"⏱ Interval set to {mins} minutes ✅", reply_markup=kb_intervals(mins))
 
-# Owner panel
-@dp.callback_query(F.data == "owner:night:toggle")
-async def cb_night_toggle(cq: CallbackQuery):
-    if not is_owner(cq.from_user.id): return
-    set_night_enabled(not night_enabled())
-    await view_home(cq, cq.from_user.id)
+# Message (instructions only)
+@dp.callback_query(F.data == "menu:msg")
+async def menu_msg(cq: CallbackQuery):
+    uid = cq.from_user.id
+    txt = (
+        "📝 Message — Pinned Saved Message\n"
+        "✇ The worker forwards the <b>pinned message</b> from each account’s <b>Saved Messages</b>.\n"
+        "✇ Steps (per account):\n"
+        "  • Send your ad to “Saved Messages”\n"
+        "  • Include premium emojis / media / links as you like\n"
+        "  • <b>Pin</b> that message\n"
+        "✇ That’s it — nothing to set here.\n"
+        "✇ Use <b>👁 Preview Tip</b> for a quick check idea."
+    )
+    await cq.message.edit_text(txt, reply_markup=kb_msg_menu())
+
+@dp.callback_query(F.data == "msg:howto")
+async def msg_howto(cq: CallbackQuery):
+    await cq.message.edit_text(
+        "📖 How it works\n"
+        "✇ We don’t store ad text/media in DB.\n"
+        "✇ Your session posts the pinned Saved Message directly.\n"
+        "✇ Change the ad? Just edit or re-pin in Saved Messages.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:msg")]])
+    )
+
+@dp.callback_query(F.data == "msg:previewtip")
+async def msg_preview_tip(cq: CallbackQuery):
+    await cq.message.edit_text(
+        "👁 Preview tip\n"
+        "✇ Forward that pinned Saved Message to a private test group/channel where your account has access.\n"
+        "✇ Confirm media, formatting, and premium emojis look correct.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:msg")]])
+    )
+
+# Disclaimer
+@dp.callback_query(F.data == "menu:disc")
+async def cb_disc(cq: CallbackQuery):
+    await view_disclaimer(cq)
+
+# Owner panel: stats/top/night/broadcast/upgrade
+def _is_owner(uid:int)->bool: return OWNER_ID and uid == OWNER_ID
 
 @dp.callback_query(F.data == "owner:stats")
 async def cb_owner_stats(cq: CallbackQuery):
-    if not is_owner(cq.from_user.id): return
+    if not _is_owner(cq.from_user.id): return
     text = (f"📊 Stats\n"
             f"✇ Users: {users_count()}\n"
             f"✇ Active (≥1 session): {sessions_count()}\n"
             f"✇ Total forwarded: {get_total_sent_ok()}")
-    await safe_edit_text(cq.message, text, reply_markup=kb_main(cq.from_user.id))
+    await cq.message.edit_text(text, reply_markup=kb_main(cq.from_user.id))
 
 @dp.callback_query(F.data == "owner:top")
 async def cb_owner_top(cq: CallbackQuery):
-    if not is_owner(cq.from_user.id): return
+    if not _is_owner(cq.from_user.id): return
     rows = top_users(10)
     if not rows:
         text = "🏆 Top Users (forwards)\n✇ No data yet."
     else:
         lines = [f"{i+1}. {r['user_id']} — {r['sent_ok']} msgs" for i,r in enumerate(rows)]
         text = "🏆 Top Users (forwards)\n" + "\n".join(lines)
-    await safe_edit_text(cq.message, text, reply_markup=kb_main(cq.from_user.id))
+    await cq.message.edit_text(text, reply_markup=kb_main(cq.from_user.id))
 
-# Commands: pause/resume/fstats + owner stats/top
-@dp.message(Command("pause"))
-async def cmd_pause(msg: Message):
-    uid = msg.from_user.id
-    _set_paused(uid, True)
-    await msg.answer("⏸ Paused. Use /resume to continue.", reply_markup=kb_main(uid))
+@dp.callback_query(F.data == "owner:night:toggle")
+async def cb_night_toggle(cq: CallbackQuery):
+    if not _is_owner(cq.from_user.id): return
+    set_night_enabled(not night_enabled())
+    await view_home(cq, cq.from_user.id)
 
-@dp.message(Command("resume"))
-async def cmd_resume(msg: Message):
-    uid = msg.from_user.id
-    _set_paused(uid, False)
-    await msg.answer("▶️ Resumed. Worker will follow your interval.", reply_markup=kb_main(uid))
+# Owner: Broadcast (UI)
+@dp.callback_query(F.data == "owner:broadcast")
+async def cb_owner_broadcast(cq: CallbackQuery, state: FSMContext):
+    if not _is_owner(cq.from_user.id): return
+    await state.set_state(OwnerFlow.broadcast)
+    await cq.message.edit_text(
+        "📣 Broadcast\n"
+        "✇ Send the message text now. It will be sent to all users.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅ Cancel", callback_data="menu:home")]
+        ])
+    )
 
-@dp.message(Command("fstats"))
-async def cmd_fstats(msg: Message):
-    uid = msg.from_user.id
-    await msg.answer(_forward_stats_text(uid), reply_markup=kb_main(uid))
+@dp.message(OwnerFlow.broadcast)
+async def on_broadcast_text(msg: Message, state: FSMContext):
+    if not _is_owner(msg.from_user.id):
+        await state.clear(); return
+    text = msg.text
+    await msg.answer("📤 Broadcasting…")
+    conn = get_conn()
+    uids = [r["user_id"] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+    conn.close()
+    ok = bad = 0
+    for i, uid in enumerate(uids, 1):
+        try:
+            await bot.send_message(uid, text)
+            ok += 1
+        except Exception:
+            bad += 1
+        if i % 25 == 0:
+            await asyncio.sleep(1.2)
+    await state.clear()
+    await msg.answer(f"✅ Done. Sent: {ok} | Failed: {bad}")
 
+# Owner: Upgrade/Downgrade (UI)
+@dp.callback_query(F.data == "owner:upgrade")
+async def cb_owner_upgrade_menu(cq: CallbackQuery):
+    if not _is_owner(cq.from_user.id): return
+    await cq.message.edit_text("💎 Premium Controls", reply_markup=kb_owner_upgrade_menu())
+
+@dp.callback_query(F.data == "owner:upgrade:do")
+async def cb_owner_upgrade_do(cq: CallbackQuery, state: FSMContext):
+    if not _is_owner(cq.from_user.id): return
+    await state.set_state(OwnerFlow.upgrade_user)
+    await cq.message.edit_text(
+        "✇ Send the <code>user_id</code> to upgrade (next message).\n(Then I'll ask for an optional locked name.)",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]])
+    )
+
+@dp.message(OwnerFlow.upgrade_user)
+async def on_upgrade_user(msg: Message, state: FSMContext):
+    if not _is_owner(msg.from_user.id):
+        await state.clear(); return
+    try:
+        target = int(msg.text.strip())
+    except Exception:
+        await msg.answer("❌ user_id must be an integer. Try again or /cancel."); return
+    await state.update_data(target=target)
+    await state.set_state(OwnerFlow.upgrade_name)
+    await msg.answer("✇ Send locked display name (or send '-' to skip):")
+
+@dp.message(OwnerFlow.upgrade_name)
+async def on_upgrade_name(msg: Message, state: FSMContext):
+    if not _is_owner(msg.from_user.id):
+        await state.clear(); return
+    data = await state.get_data()
+    target = data.get("target")
+    locked = None if msg.text.strip() == "-" else msg.text.strip()
+    set_name_lock(target, True, name=locked)
+    await state.clear()
+    await msg.answer(f"✅ Premium name-lock enabled for <code>{target}</code>{' with name “'+locked+'”' if locked else ''}.")
+
+@dp.callback_query(F.data == "owner:downgrade:do")
+async def cb_owner_downgrade_do(cq: CallbackQuery, state: FSMContext):
+    if not _is_owner(cq.from_user.id): return
+    await state.set_state(OwnerFlow.downgrade_user)
+    await cq.message.edit_text(
+        "✇ Send the <code>user_id</code> to downgrade (next message).",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]])
+    )
+
+@dp.message(OwnerFlow.downgrade_user)
+async def on_downgrade_user(msg: Message, state: FSMContext):
+    if not _is_owner(msg.from_user.id):
+        await state.clear(); return
+    try:
+        target = int(msg.text.strip())
+    except Exception:
+        await msg.answer("❌ user_id must be integer"); return
+    set_name_lock(target, False)
+    await state.clear()
+    await msg.answer(f"✅ Premium name-lock disabled for <code>{target}</code>.")
+
+# Owner shortcuts
 @dp.message(Command("stats"))
 async def cmd_stats(msg: Message):
-    if not is_owner(msg.from_user.id): return
+    if not _is_owner(msg.from_user.id): return
     await msg.answer(f"📊 Users: {users_count()} | Active (≥1 session): {sessions_count()} | Forwarded: {get_total_sent_ok()}")
 
 @dp.message(Command("top"))
 async def cmd_top(msg: Message):
-    if not is_owner(msg.from_user.id): return
+    if not _is_owner(msg.from_user.id): return
     try:
         n = int((msg.text.split(maxsplit=1)[1]).strip())
     except Exception:
@@ -563,6 +664,28 @@ async def cmd_top(msg: Message):
         await msg.answer("🏆 No data yet."); return
     lines = [f"{i+1}. <code>{r['user_id']}</code> — {r['sent_ok']} msgs" for i,r in enumerate(rows)]
     await msg.answer("🏆 Top Users (forwards)\n" + "\n".join(lines))
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(msg: Message):
+    if not _is_owner(msg.from_user.id): return
+    try:
+        text = msg.text.split(maxsplit=1)[1]
+    except Exception:
+        await msg.answer("Usage:\n/broadcast your message text"); return
+    await msg.answer("📤 Broadcasting…")
+    conn = get_conn()
+    uids = [r["user_id"] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+    conn.close()
+    ok = bad = 0
+    for i, uid in enumerate(uids, 1):
+        try:
+            await bot.send_message(uid, text)
+            ok += 1
+        except Exception:
+            bad += 1
+        if i % 25 == 0:
+            await asyncio.sleep(1.2)
+    await msg.answer(f"✅ Done. Sent: {ok} | Failed: {bad}")
 
 # Referrals
 @dp.message(Command("ref"))
@@ -612,7 +735,47 @@ async def cmd_reftop(msg: Message):
     lines = [f"{i+1}. <code>{uid}</code> — {cnt}" for i,(uid,cnt) in enumerate(pairs)]
     await msg.answer("🏆 Referral Leaderboard\n" + "\n".join(lines))
 
-# -------------- Runner --------------
+# /fstats (per-user forward status)
+def _fmt_next(delta_sec: int) -> str:
+    if delta_sec <= 0:
+        return "soon"
+    m, s = divmod(delta_sec, 60)
+    h, m = divmod(m, 60)
+    parts = []
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if s and not h: parts.append(f"{s}s")
+    return " ".join(parts) if parts else "soon"
+
+@dp.message(Command("fstats"))
+async def cmd_fstats(msg: Message):
+    uid = msg.from_user.id
+    interval = int(get_interval(uid) or 30)
+    groups_n = len(list_groups(uid))
+    sessions_n = sessions_count_user(uid)
+    paused = _is_paused(uid)
+    last_ts = get_last_sent_at(uid)
+    import time as _t
+    now = int(_t.time())
+    due = 0
+    if last_ts is None:
+        due = 0
+    else:
+        gap = interval*60 - (now - last_ts)
+        due = max(0, gap)
+    status = "PAUSED" if paused else "RUNNING"
+    night = "ON" if night_enabled() else "OFF"
+    txt = (
+        "📟 Forward Stats\n"
+        f"✇ {'⏸' if paused else '▶️'} Worker: {status}\n"
+        f"✇ Interval: {interval} min\n"
+        f"✇ Sessions: {sessions_n}  |  Groups: {groups_n}\n"
+        f"✇ Next send: {_fmt_next(due)}\n"
+        f"🌙 Night Mode {night}"
+    )
+    await msg.answer(txt)
+
+# ---------------- Runner ----------------
 async def main():
     try:
         await dp.start_polling(bot)
