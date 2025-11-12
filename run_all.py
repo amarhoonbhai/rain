@@ -1,103 +1,84 @@
-# run_all.py — resilient supervisor for main_bot, worker_forward, login_bot, profile_enforcer
-import asyncio, logging, os, signal, contextlib, traceback
-from datetime import datetime
-from dotenv import load_dotenv
+# run_all.py — supervise all services with singleton lock & restarts
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("supervisor")
+import os, sys, asyncio, traceback, time
 
-load_dotenv()
-MAIN_BOT_TOKEN  = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
-LOGIN_BOT_TOKEN = (os.getenv("LOGIN_BOT_TOKEN") or "").strip()
-ENFORCER_ENABLED = os.getenv("ENFORCER_ENABLED", "1").strip() not in ("0","false","False","")
+# -------- Singleton lock (avoid "Conflict: terminated by other getUpdates") ----
+LOCK_PATH = "/tmp/rain_run_all.lock"
+try:
+    import fcntl
+    _lockf = open(LOCK_PATH, "w")
+    fcntl.flock(_lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    _lockf.write(str(os.getpid()))
+    _lockf.flush()
+except Exception:
+    print("Another run_all.py is already running. Exiting.")
+    sys.exit(0)
 
-async def _run_forever(name: str, starter):
-    backoff = 3
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+async def _run_forever(name: str, starter, min_backoff=3, max_backoff=30):
+    """Restart a component on crash with capped backoff."""
+    backoff = min_backoff
     while True:
         try:
-            log.info(f"[{name}] starting…")
+            print(f"[{name}] starting…")
             await starter()
-            log.warning(f"[{name}] returned; restarting in {backoff}s…")
         except asyncio.CancelledError:
-            log.info(f"[{name}] cancelled — shutting down.")
-            raise
+            print(f"[{name}] cancelled, stopping.")
+            return
         except Exception as e:
-            log.error(f"[{name}] crashed: {e}\n{traceback.format_exc()}")
-            log.info(f"[{name}] restarting in {backoff}s…")
+            print(f"[{name}] crashed: {e}")
+            traceback.print_exc()
+        print(f"[{name}] restarting in {backoff}s…")
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 30)
+        backoff = min(max_backoff, backoff * 2)
 
+# ----- Starters ---------------------------------------------------------------
 async def serve_bot():
     import main_bot
     await main_bot.main()
 
 async def serve_worker():
     import worker_forward
-    entry = getattr(worker_forward, "main", None) or getattr(worker_forward, "main_loop", None)
-    if entry is None:
-        raise RuntimeError("worker_forward has no main()/main_loop()")
-    await entry()
+    await worker_forward.main()
 
 async def serve_login_bot():
-    if not (LOGIN_BOT_TOKEN and ":" in LOGIN_BOT_TOKEN):
-        log.info("[login-bot] LOGIN_BOT_TOKEN not set — skipping.")
-        while True:  # placeholder idle task
-            await asyncio.sleep(3600)
+    # LOGIN_BOT_TOKEN may be optional; skip if not present
+    token = (os.getenv("LOGIN_BOT_TOKEN") or "").strip()
+    if not token or ":" not in token:
+        print("[login-bot] LOGIN_BOT_TOKEN not set — skipping.")
+        # idle loop so the supervisor keeps running without restarting this
+        while True: await asyncio.sleep(3600)
     import login_bot
-    entry = getattr(login_bot, "login_bot_main", None) or getattr(login_bot, "main", None)
-    if entry is None:
-        raise RuntimeError("login_bot has no login_bot_main()/main()")
-    await entry()
+    await login_bot.login_bot_main()
 
 async def serve_enforcer():
-    if not ENFORCER_ENABLED:
-        log.info("[enforcer] disabled — skipping.")
-        while True:
-            await asyncio.sleep(3600)
-    import profile_enforcer
+    # profile_enforcer is optional; if missing, skip quietly
+    try:
+        import profile_enforcer
+    except Exception:
+        print("[enforcer] module missing — skipping.")
+        while True: await asyncio.sleep(3600)
     await profile_enforcer.main()
 
-async def heartbeat(stop_event: asyncio.Event):
-    n = 0
-    while not stop_event.is_set():
-        n += 1
-        log.info(f"[hb] alive #{n} @ {datetime.utcnow().isoformat()}Z")
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            pass
-
+# ----- Orchestrator -----------------------------------------------------------
 async def main():
-    if not (MAIN_BOT_TOKEN and ":" in MAIN_BOT_TOKEN):
-        raise RuntimeError("MAIN_BOT_TOKEN missing/malformed in .env")
-
-    stop_event = asyncio.Event()
-
-    def _sig_handler(sig, frame):
-        log.info(f"[svc] got signal {sig}, shutting down…")
-        stop_event.set()
-
-    for s in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(Exception):
-            signal.signal(s, _sig_handler)
-
     tasks = [
-        asyncio.create_task(_run_forever("main-bot",  lambda: serve_bot())),
-        asyncio.create_task(_run_forever("worker",    lambda: serve_worker())),
-        asyncio.create_task(_run_forever("login-bot", lambda: serve_login_bot())),
-        asyncio.create_task(_run_forever("enforcer",  lambda: serve_enforcer())),
-        asyncio.create_task(heartbeat(stop_event)),
+        asyncio.create_task(_run_forever("main-bot",   serve_bot)),
+        asyncio.create_task(_run_forever("worker",     serve_worker)),
+        asyncio.create_task(_run_forever("login-bot",  serve_login_bot)),
+        asyncio.create_task(_run_forever("enforcer",   serve_enforcer)),
     ]
-
-    await stop_event.wait()
-    for t in tasks: t.cancel()
-    for t in tasks:
-        with contextlib.suppress(asyncio.CancelledError):
-            await t
+    try:
+        while True:
+            await asyncio.sleep(300)  # heartbeat
+            print("[hb] alive @", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt — shutting down…")
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
