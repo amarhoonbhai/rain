@@ -1,244 +1,323 @@
-# worker_forward.py — precise interval scheduler + 10s per-group delay + no-join mode
+# worker_forward.py — command listener (self-messages) + scheduler (pinned ad) + 10s gaps
 import os, asyncio, logging, re, time as _time
-from urllib.parse import urlparse
 from datetime import datetime, time
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from pyrogram import Client
+from pyrogram import Client, filters
+from pyrogram.types import Message
 from pyrogram.errors import (
     FloodWait, RPCError,
     Unauthorized, AuthKeyUnregistered,
 )
 try:
-    from pyrogram.errors import SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan, UsernameInvalid, UsernameNotOccupied
-except Exception:  # best-effort fallbacks
-    class _E(Exception): ...
-    SessionRevoked = SessionExpired = UserDeactivated = UserDeactivatedBan = UsernameInvalid = UsernameNotOccupied = _E
+    from pyrogram.errors import SessionRevoked, SessionExpired, UserNotParticipant, ChatAdminRequired
+except Exception:
+    class _Dummy(Exception): pass
+    SessionRevoked = SessionExpired = UserNotParticipant = ChatAdminRequired = _Dummy
 
 from core.db import (
     init_db,
     users_with_sessions, sessions_strings,
-    list_groups,
-    get_ad, get_interval, get_last_sent_at, mark_sent_now,
-    night_enabled, inc_sent_ok,
+    list_groups, add_group, clear_groups,
+    get_interval, mark_sent_now, last_sent_at_for, inc_sent_ok,
+    set_interval,
+    is_premium, is_gc_unlocked, groups_cap,
+    night_enabled,
 )
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 log = logging.getLogger("worker")
 
-# --------- time gates ----------
 IST = ZoneInfo("Asia/Kolkata")
 NIGHT_START = time(0, 0)
 NIGHT_END   = time(7, 0)
 
-def _is_night_now_ist() -> bool:
+SPLIT_RE = re.compile(r"[,\s]+")
+
+def is_night_now_ist() -> bool:
     now = datetime.now(IST).time()
     return NIGHT_START <= now < NIGHT_END
 
-# --------- tokens / targets ----------
-SPLIT_RE = re.compile(r"[,\s]+")
-USERNAME_RE = re.compile(r"^@?([A-Za-z0-9_]{5,})$")
+# ---------- utils ----------
+def _parse_interval_to_minutes(spec: str) -> int | None:
+    s = spec.strip().lower()
+    if not s: return None
+    if s.endswith("m"):
+        return int(s[:-1])
+    if s.endswith("h"):
+        return int(float(s[:-1]) * 60)
+    return int(s)
 
-def expand_targets(rows: list[str]) -> list[str]:
-    out, seen = [], set()
-    for raw in rows or []:
-        if not raw: continue
-        for t in SPLIT_RE.split(str(raw).strip()):
-            t = t.strip().rstrip("/.,")
-            if not t: continue
-            if t not in seen:
-                seen.add(t); out.append(t)
-    return out
+def _resolve_target_token(token: str):
+    """Return (chat_id or username string) — we don't auto-join; send will try."""
+    token = token.strip()
+    if not token: return None
+    if token.lstrip("-").isdigit():
+        try: return int(token)
+        except Exception: return None
+    if token.startswith("@"):
+        return token
+    if token.startswith("http"):
+        u = urlparse(token)
+        if u.netloc.lower() == "t.me":
+            # either username (/name) or invite (+hash); keep full link for copy_message fallback
+            return token
+    return token  # raw
 
-def extract_username_from_link(s: str) -> str | None:
-    # Converts https://t.me/username → username
-    if not s.startswith("http"): return None
-    u = urlparse(s)
-    if u.netloc.lower() != "t.me": return None
-    path = u.path.strip("/")
-    if not path or path.startswith("+") or path.startswith("joinchat"):
-        return None  # invite link → NO-JOIN (kept in DB; skip at send-time)
-    uname = path.split("/")[0]
-    return uname if USERNAME_RE.match(uname) else None
-
-def normalize_tokens(tokens: list[str]) -> list[str]:
-    norm = []
-    for t in tokens:
-        if t.lstrip("-").isdigit():         # numeric id (public/private) → keep
-            norm.append(t); continue
-        m = USERNAME_RE.match(t.lstrip("@"))
-        if m:                               # @username → store bare username
-            norm.append(m.group(1)); continue
-        u = extract_username_from_link(t)   # t.me/username
-        if u:
-            norm.append(u); continue
-        norm.append(t)  # keep invite links / unknowns; we’ll skip at runtime
-    # de-dup, preserve order
-    seen, out = set(), []
-    for x in norm:
-        if x not in seen:
-            seen.add(x); out.append(x)
-    return out
-
-# --------- chat resolution (NO-JOIN) ----------
-async def resolve_chat(app: Client, target: str):
-    # numeric id
-    if target.lstrip("-").isdigit():
-        try:
-            return await app.get_chat(int(target))
-        except Exception as e:
-            log.info(f"[resolve] id {target} failed: {e}")
-            return None
-    # username
-    m = USERNAME_RE.match(target.lstrip("@"))
-    if m:
-        try:
-            return await app.get_chat(m.group(1))
-        except (UsernameInvalid, UsernameNotOccupied):
-            log.info(f"[resolve] @{m.group(1)} invalid/not occupied"); return None
-        except Exception as e:
-            log.info(f"[resolve] @{m.group(1)} failed: {e}"); return None
-    # links
-    if target.startswith("http"):
-        u = extract_username_from_link(target)
-        if u:
-            try:
-                return await app.get_chat(u)
-            except Exception as e:
-                log.info(f"[resolve] link→@{u} failed: {e}")
-                return None
-        # invite link (private) — require manual join
-        log.info(f"[resolve] invite link kept (NO-JOIN): {target}")
-        return None
+async def _find_pinned_in_saved(app: Client) -> Message | None:
+    """
+    Return pinned Message from 'Saved Messages' if present, else None.
+    """
+    try:
+        # get recent messages; find one with pinned flag
+        async for m in app.get_chat_history("me", limit=100):
+            if getattr(m, "pinned", False):
+                return m
+    except Exception as e:
+        log.warning(f"[{(await app.get_me()).id}] read pinned failed: {e}")
     return None
 
-# --------- send with 10s per-group delay ----------
-async def _send_round(sess: dict, targets: list[str], text: str, parse_mode: str | None) -> int:
-    ok = 0
+async def _send_one(app: Client, target, src_msg: Message) -> bool:
+    """
+    Copy pinned message to target. target can be int id, @username, or full t.me link.
+    """
+    try:
+        # if it's a t.me link string, pyrogram copy_message accepts username part; for +invite it will fail unless member
+        if isinstance(target, str) and target.startswith("http"):
+            # try username path if possible
+            u = urlparse(target)
+            path = u.path.strip("/")
+            if path and not path.startswith("+"):
+                target = path.split("/")[0]  # username
+        await app.copy_message(chat_id=target, from_chat_id="me", message_id=src_msg.id)
+        return True
+    except FloodWait as fw:
+        log.info(f"[send] FloodWait {fw.value}s on {target}")
+        await asyncio.sleep(fw.value + 1)
+    except (UserNotParticipant, ChatAdminRequired):
+        log.info(f"[send] skipped (not a member / admin needed): {target}")
+    except Exception as e:
+        log.info(f"[send] failed on {target}: {e}")
+    return False
+
+# ---------- self-commands (work anywhere you type) ----------
+async def handle_addgc(app: Client, msg: Message, text: str):
+    me = await app.get_me()
+    uid = me.id
+    lines = [ln.strip() for ln in text.splitlines()[1:] if ln.strip()]
+    if not lines:
+        await msg.reply("✇ Usage:\n.addgc\n<id|@user|t.me/link>\n(one per line, up to 5 per command)")
+        return
+    MAX_PER_CMD = 5
+    orig = len(lines)
+    lines = lines[:MAX_PER_CMD]
+
+    existing = set(list_groups(uid))
+    cap = groups_cap(uid)
+    cap_left = max(0, cap - len(existing))
+
+    accepted = []
+    dup = 0
+    for ln in lines:
+        if ln in existing or ln in accepted:
+            dup += 1
+            continue
+        accepted.append(ln)
+
+    if cap_left <= 0:
+        await msg.reply(f"⚠️ Capacity full ({cap}). Use .cleargc to free slots.")
+        return
+
+    added = 0
+    bad = 0
+    for tok in accepted:
+        t = _resolve_target_token(tok)
+        if t is None:
+            bad += 1; continue
+        if added >= cap_left: break
+        if add_group(uid, tok):
+            added += 1
+        else:
+            bad += 1
+
+    extras = max(0, orig - MAX_PER_CMD)
+    left = max(0, cap - (len(existing) + added))
+    parts = [f"✅ Added: {added}"]
+    if dup: parts.append(f"⧗ Duplicates: {dup}")
+    if bad: parts.append(f"✖ Invalid/failed: {bad}")
+    if extras: parts.append(f"… Ignored extra lines: {extras} (max {MAX_PER_CMD}/cmd)")
+    parts.append(f"📦 Capacity left: {left}/{cap}")
+    await msg.reply("\n".join(parts))
+
+async def handle_time(app: Client, msg: Message, arg: str):
+    me = await app.get_me()
+    uid = me.id
+    if not arg:
+        await msg.reply("✇ Usage: .time 30m | 45m | 60m  (premium: 1–360m or H, e.g., 2h)")
+        return
+    try:
+        mins = _parse_interval_to_minutes(arg)
+        if mins is None: raise ValueError()
+        if is_premium(uid):
+            ok = 1 <= mins <= 360
+        else:
+            ok = mins in (30, 45, 60)
+        if not ok:
+            raise ValueError()
+        set_interval(uid, int(mins))
+        await msg.reply(f"⏱ Interval set to {mins} minutes ✅")
+    except Exception:
+        await msg.reply("❌ Invalid. Use 30m/45m/60m (premium: 1–360m or e.g., 2h).")
+
+def install_command_handlers(app: Client):
+    @app.on_message(filters.me & filters.text)
+    async def _on_me_text(_, m: Message):
+        t = (m.text or "").strip()
+        if not t.startswith("."):
+            return
+        head = t.split(None, 1)
+        cmd = head[0].lower()
+        tail = head[1] if len(head) > 1 else ""
+
+        if cmd == ".addgc":
+            await handle_addgc(app, m, t)
+        elif cmd == ".listgc":
+            me = await app.get_me()
+            uid = me.id
+            gs = list_groups(uid)
+            cap = groups_cap(uid)
+            if not gs:
+                await m.reply(f"👥 Groups: none (cap {cap}). Use .addgc")
+            else:
+                await m.reply("👥 Groups (cap {}):\n{}".format(cap, "\n".join(f"• {g}" for g in gs)))
+        elif cmd == ".cleargc":
+            me = await app.get_me(); clear_groups(me.id)
+            await m.reply("🧹 Groups cleared.")
+        elif cmd == ".time":
+            await handle_time(app, m, tail.strip())
+        elif cmd == ".status":
+            me = await app.get_me()
+            uid = me.id
+            gs = list_groups(uid)
+            it = get_interval(uid) or 30
+            last = last_sent_at_for(uid)
+            eta = "—"
+            if last is not None:
+                remain = (last + it * 60) - int(_time.time())
+                if remain > 0:
+                    mm, ss = divmod(remain, 60)
+                    hh, mm = divmod(mm, 60)
+                    if hh: eta = f"in ~{hh}h {mm}m {ss}s"
+                    else:  eta = f"in ~{mm}m {ss}s"
+                else:
+                    eta = "due now"
+            await m.reply(
+                "📟 Status\n"
+                f"✇ Interval: {it} min\n"
+                f"✇ Groups: {len(gs)} (cap {groups_cap(uid)})\n"
+                f"✇ Premium: {'ON' if is_premium(uid) else 'OFF'} | Unlock10: {'ON' if is_gc_unlocked(uid) else 'OFF'}\n"
+                f"✇ Next send: {eta}"
+            )
+        elif cmd == ".help":
+            await m.reply(
+                "✇ Commands\n"
+                "• .addgc  (then up to 5 lines: id/@user/t.me/...)\n"
+                "• .listgc / .cleargc\n"
+                "• .time 30m|45m|60m  (premium: 1–360m or e.g., 2h)\n"
+                "• .status"
+            )
+
+# ---------- scheduler loop per user ----------
+async def send_cycle_for_user(sess: dict):
+    uid = sess["user_id"]
     app = Client(
-        name=f"user-{sess['user_id']}-s{sess['slot']}",
+        name=f"user-{uid}",
         api_id=int(sess["api_id"]),
         api_hash=str(sess["api_hash"]),
         session_string=str(sess["session_string"]),
     )
     try:
         await app.start()
-    except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
-        log.error(f"[u{sess['user_id']} s{sess['slot']}] auth/start error: {e}")
-        return 0
+    except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired) as e:
+        log.error(f"[u{uid}] auth error: {e}")
+        return
     except Exception as e:
-        log.error(f"[u{sess['user_id']} s{sess['slot']}] start failed: {e}")
-        return 0
+        log.error(f"[u{uid}] start failed: {e}")
+        return
 
-    for i, tgt in enumerate(targets, 1):
-        chat = await resolve_chat(app, tgt)
-        if chat is None:
-            log.info(f"[u{sess['user_id']}] skip (not resolved / invite-only): {tgt}")
-        else:
+    # install dot-commands
+    install_command_handlers(app)
+
+    try:
+        while True:
             try:
-                await app.send_message(chat_id=chat.id, text=text, parse_mode=parse_mode)
-                ok += 1
-                log.info(f"[u{sess['user_id']} s{sess['slot']}] sent to {getattr(chat,'username',None) or chat.id} ({i}/{len(targets)})")
+                # night mode
+                if night_enabled() and is_night_now_ist():
+                    await asyncio.sleep(30)
+                    continue
+
+                interval = get_interval(uid) or 30
+                last = last_sent_at_for(uid)
+                now = int(_time.time())
+                if last is not None and now - last < interval * 60:
+                    await asyncio.sleep(10)
+                    continue
+
+                # need to send
+                pinned = await _find_pinned_in_saved(app)
+                if not pinned:
+                    try:
+                        await app.send_message("me", "✇ No pinned ad found in Saved Messages. Pin your ad and try again.")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(30)
+                    continue
+
+                targets = list_groups(uid)
+                if not targets:
+                    await asyncio.sleep(20)
+                    continue
+
+                ok = 0
+                for raw in targets:
+                    tgt = _resolve_target_token(raw)
+                    if tgt is None: continue
+                    if await _send_one(app, tgt, pinned):
+                        ok += 1
+                    await asyncio.sleep(10)  # 10s gap
+                if ok > 0:
+                    mark_sent_now(uid)
+                    inc_sent_ok(uid, ok)
+                    log.info(f"[u{uid}] sent_ok+={ok}")
+                else:
+                    log.info(f"[u{uid}] nothing sent")
+
             except FloodWait as fw:
-                log.warning(f"[u{sess['user_id']} s{sess['slot']}] FloodWait {fw.value}s → waiting")
                 await asyncio.sleep(fw.value + 1)
-            except RPCError as e:
-                log.warning(f"[u{sess['user_id']} s{sess['slot']}] RPCError on {tgt}: {e}")
             except Exception as e:
-                log.warning(f"[u{sess['user_id']} s{sess['slot']}] send failed on {tgt}: {e}")
-
-        # fixed 10s delay between each group (even if previous failed)
-        if i < len(targets):
-            await asyncio.sleep(10)
-
-    try:
-        await app.stop()
-    except Exception:
-        pass
-    return ok
-
-# --------- scheduler (exactly mirrors /fstats logic) ----------
-def _parse_mode_string(s: str | None):
-    if not s: return None
-    s = s.strip().lower()
-    if s in ("markdown", "md"): return "markdown"
-    if s in ("html", "htm"): return "html"
-    return None
-
-def _next_slot_index(user_id: int, total: int) -> int:
-    # simple round-robin across user’s sessions
-    key = f"worker:last_session:{user_id}"
-    try:
-        import core.db as db
-        cur = int(db.get_setting(key, -1) or -1)
-        nxt = (cur + 1) % max(1, total)
-        db.set_setting(key, nxt)
-        return nxt
-    except Exception:
-        return 0
-
-async def process_user(user_id: int):
-    # night mode hard-gate
-    if night_enabled() and _is_night_now_ist():
-        return
-
-    # must have text & groups & sessions
-    text, mode = get_ad(user_id)
-    if not text:
-        log.info(f"[u{user_id}] no ad text set"); return
-    groups = list_groups(user_id)
-    if not groups:
-        log.info(f"[u{user_id}] no groups configured"); return
-    sessions = sessions_strings(user_id)
-    if not sessions:
-        log.info(f"[u{user_id}] no sessions"); return
-
-    # interval check
-    interval_min = int(get_interval(user_id) or 30)
-    interval_sec = interval_min * 60
-    last_ts = get_last_sent_at(user_id)
-    now = int(_time.time())
-    if last_ts is not None:
-        try: last_ts = int(last_ts)
-        except Exception: last_ts = int(float(str(last_ts)))
-        left = interval_sec - (now - last_ts)
-        if left > 0:
-            log.info(f"[u{user_id}] not due yet ({left}s left)")
-            return
-
-    # pick a session and send to ALL targets with 10s gaps
-    idx = _next_slot_index(user_id, len(sessions))
-    sess = sessions[idx]
-
-    targets = normalize_tokens(expand_targets(groups))
-    if not targets:
-        log.info(f"[u{user_id}] no valid targets after normalization")
-        return
-
-    sent_ok = await _send_round(sess, targets, text, _parse_mode_string(mode))
-    if sent_ok > 0:
-        mark_sent_now(user_id)
-        inc_sent_ok(user_id, sent_ok)
-        log.info(f"[u{user_id}] round complete: sent_ok+={sent_ok}")
-    else:
-        log.info(f"[u{user_id}] round complete: nothing sent")
-
-async def main_loop():
-    init_db()
-    while True:
-        try:
-            for uid in users_with_sessions():
-                try:
-                    await process_user(uid)
-                except Exception as e:
-                    log.error(f"[u{uid}] process error: {e}")
-                await asyncio.sleep(0.2)  # small breath per user
-        except Exception as e:
-            log.error(f"loop error: {e}")
-        await asyncio.sleep(10)  # tick every 10s
+                log.error(f"[u{uid}] cycle error: {e}")
+                await asyncio.sleep(5)
+    finally:
+        try: await app.stop()
+        except Exception: pass
 
 async def main():
-    await main_loop()
+    init_db()
+    # create a dedicated loop per account (user_id)
+    tasks = []
+    for uid in users_with_sessions():
+        # pick first slot for that uid
+        s_rows = sessions_strings(uid)
+        if not s_rows:
+            continue
+        tasks.append(asyncio.create_task(send_cycle_for_user(s_rows[0])))
+    if not tasks:
+        log.info("no sessions found")
+        # idle loop
+        while True:
+            await asyncio.sleep(60)
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     asyncio.run(main())
