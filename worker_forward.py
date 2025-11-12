@@ -1,55 +1,127 @@
-# worker_forward.py — Saved-All mode (round-robin over your Saved Messages)
-# At each interval:
-#   1) Pick the next message from your "Saved Messages" (oldest→newest, round-robin)
-#   2) Copy it to every saved target (10s delay per target)
-# Commands (send from the logged-in account):
-#   .help            — show usage
-#   .addgc …         — add targets (@usernames, numeric ids, ANY t.me link incl. private)
-#   .gc              — list saved targets
-#   .time 30m|45m|60m — set interval
-#   .adreset         — reset Saved-message cursor to the first item
-#
-# Requires core.db:
-#   init_db(), users_with_sessions(), sessions_list(),
-#   list_groups(), add_group(), groups_cap(),
-#   get_interval(), set_interval(),
-#   get_last_sent_at(), mark_sent_now(), inc_sent_ok(),
-#   night_enabled(), set_setting(), get_setting()
+# worker_forward.py — Saved-All (no pinned), clean scheduler
+# - Sends the next NEW message from Saved Messages (“me”) each interval
+# - Default interval = 30 minutes (auto-applied if unset)
+# - Scan loop every 15s
+# - 10s delay between groups
+# - Accepts any tokens (username / id / t.me link); NO auto-join
+#   • t.me invite links are saved but skipped; user gets a DM reminder (cooldown)
+# - Auto-rehydrate DM for expired/revoked sessions (cooldown)
+# - Honors Night Mode (00:00–07:00 IST) via db.night_enabled()
 
 import os, asyncio, logging, re, time as _time
-from typing import Optional, List, Dict
-from datetime import datetime, timezone
 from urllib.parse import urlparse
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
-from aiogram import Bot  # for optional DM notifier
-
-from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, RPCError, Unauthorized, AuthKeyUnregistered
+from pyrogram import Client
+from pyrogram.errors import (
+    FloodWait, RPCError, UsernameInvalid, UsernameNotOccupied,
+    Unauthorized, AuthKeyUnregistered,
+)
 try:
     from pyrogram.errors import SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan, UserNotParticipant
 except Exception:
     class _E(Exception): pass
     SessionRevoked = SessionExpired = UserDeactivated = UserDeactivatedBan = UserNotParticipant = _E
 
+from aiogram import Bot as AioBot
+
 from core.db import (
     init_db,
-    users_with_sessions, sessions_list,
-    list_groups, add_group, groups_cap,
-    get_interval, set_interval,
-    get_last_sent_at, mark_sent_now, inc_sent_ok,
-    night_enabled, set_setting, get_setting,
+    users_with_sessions, sessions_strings,
+    list_groups, get_interval, night_enabled,
+    mark_sent_now, inc_sent_ok,
+    get_setting, set_setting, set_interval,
 )
 
+# ---------- logging ----------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("worker")
 
-# Optional DM notifier for session problems
-BOT_TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
-BOT_NOTIFIER = Bot(BOT_TOKEN) if BOT_TOKEN and ":" in BOT_TOKEN else None
-AUTH_PING_COOLDOWN_SEC = 6 * 3600
+# ---------- const ----------
+IST = ZoneInfo("Asia/Kolkata")
+NIGHT_START = time(0, 0)
+NIGHT_END   = time(7, 0)
 
+SEND_BETWEEN_GROUPS_SEC = 10
+SCAN_PERIOD_SEC = 15
+HISTORY_FETCH_LIMIT = 200
+DEFAULT_INTERVAL_MIN = 30
+
+# Main bot for DMs (rehydrate + join-manual nudges)
+BOT_TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+BOT_NOTIFIER = AioBot(BOT_TOKEN) if BOT_TOKEN and ":" in BOT_TOKEN else None
+
+AUTH_PING_ENABLED = str(os.getenv("AUTH_PING_ENABLED", "1")).strip().lower() in ("1","true","yes")
+AUTH_PING_COOLDOWN_SEC = int(os.getenv("AUTH_PING_COOLDOWN_SEC", "21600"))  # 6h
+
+JOIN_NUDGE_COOLDOWN_SEC = 6 * 3600  # DM “join manually” at most every 6h per (user,token)
+
+NO_AUTO_JOIN = True  # never join on our own
+
+USERNAME_RE = re.compile(r"^@?([A-Za-z0-9_]{5,})$")
+SPLIT_RE = re.compile(r"[,\s]+")
+
+# ---------- helpers: targets ----------
+def expand_tokens(raw_list: list[str]) -> list[str]:
+    out, seen = [], set()
+    for entry in raw_list or []:
+        if not entry: continue
+        for tok in SPLIT_RE.split(entry.strip()):
+            t = tok.strip().rstrip("/.,")
+            if not t: continue
+            if t not in seen:
+                seen.add(t); out.append(t)
+    return out
+
+def extract_username_from_link(s: str) -> str | None:
+    if not s.startswith("http"): return None
+    u = urlparse(s)
+    if u.netloc.lower() != "t.me": return None
+    path = u.path.strip("/")
+    if not path or path.startswith("+") or path.startswith("joinchat"):
+        return None  # that’s an invite link; handled elsewhere
+    uname = path.split("/")[0]
+    return uname if USERNAME_RE.match(uname) else None
+
+def normalize_tokens(tokens: list[str]) -> list[str]:
+    norm, seen = [], set()
+    for t in tokens:
+        if not t: continue
+        if t.lstrip("-").isdigit():
+            x = t  # numeric id
+        else:
+            m = USERNAME_RE.match(t.lstrip("@"))
+            if m: x = m.group(1)   # username
+            else:
+                u = extract_username_from_link(t)
+                x = u if u else t  # keep invite links as-is (for reminder)
+        if x not in seen:
+            seen.add(x); norm.append(x)
+    return norm
+
+def is_invite_link(token: str) -> bool:
+    if not token.startswith("http"): return False
+    u = urlparse(token)
+    if u.netloc.lower() != "t.me": return False
+    path = u.path.strip("/")
+    return bool(path.startswith("+") or path.startswith("joinchat"))
+
+# ---------- helpers: time / state ----------
+def is_night_now_ist() -> bool:
+    now = datetime.now(IST).time()
+    return NIGHT_START <= now < NIGHT_END
+
+def _choose_session_index(user_id: int, total: int) -> int:
+    key = f"worker:last_session:{user_id}"
+    cur = int(get_setting(key, -1) or -1)
+    nxt = (cur + 1) % max(1, total)
+    set_setting(key, nxt)
+    return nxt
+
+# ---------- DM notifiers ----------
 async def _notify_rehydrate(user_id: int, slot: int, reason: str):
-    if BOT_NOTIFIER is None:
+    if not AUTH_PING_ENABLED or BOT_NOTIFIER is None:
         return
     key = f"authping:{user_id}:{slot}"
     last = int(get_setting(key, 0) or 0)
@@ -57,334 +129,199 @@ async def _notify_rehydrate(user_id: int, slot: int, reason: str):
     if now - last < AUTH_PING_COOLDOWN_SEC:
         return
     set_setting(key, now)
+    txt = (
+        "✇ Session issue detected\n"
+        f"✇ Your account (slot {slot}) looks <b>expired / unauthorized</b>.\n"
+        "✇ Please log in again via <b>@SpinifyLoginBot</b>.\n"
+        f"✇ Reason: <code>{reason}</code>\n"
+        "✇ This check runs every ≤15s."
+    )
     try:
-        await BOT_NOTIFIER.send_message(
-            user_id,
-            "✇ Session issue detected\n"
-            f"✇ Slot <b>{slot}</b> unauthorized/expired.\n"
-            "✇ Re-login via <b>@SpinifyLoginBot</b>.\n"
-            f"✇ Reason: <code>{reason}</code>"
-        )
+        await BOT_NOTIFIER.send_message(user_id, txt)
     except Exception:
         pass
 
-# ---- target parsing ----
-SPLIT_RE = re.compile(r"[,\n\r\t ]+")
-USERNAME_RE = re.compile(r"^@?([A-Za-z0-9_]{5,})$")
-
-def _extract_username_from_link(s: str) -> Optional[str]:
-    # Convert t.me/username → username. Keep invite links as-is (we can’t send to them).
-    if not s.startswith("http"): return None
-    u = urlparse(s)
-    if u.netloc.lower() != "t.me": return None
-    path = u.path.strip("/")
-    if not path or path.startswith("+") or path.startswith("joinchat"):
-        return None
-    uname = path.split("/")[0]
-    return uname if USERNAME_RE.match(uname) else None
-
-def _normalize_targets(chunks: List[str]) -> List[str]:
-    out, seen = [], set()
-    for raw in chunks:
-        t = (raw or "").strip().rstrip("/.,")
-        if not t:
-            continue
-        if t.lstrip("-").isdigit():
-            key = t
-        else:
-            m = USERNAME_RE.match(t.lstrip("@"))
-            if m:
-                key = m.group(1)                 # clean @
-            else:
-                u = _extract_username_from_link(t)
-                key = u if u else t              # keep private invite link string
-        if key and key not in seen:
-            seen.add(key); out.append(key)
-    return out
-
-def _is_invite_link(t: str) -> bool:
-    if not t.startswith("http"): return False
-    u = urlparse(t)
-    if u.netloc.lower() != "t.me": return False
-    p = u.path.strip("/")
-    return (p.startswith("+") or p.startswith("joinchat"))
-
-# ---- saved messages window / cursor ----
-def _ad_window_key(user_id: int) -> str:
-    return f"ad_window:{user_id}"   # latest N to consider (default 200)
-
-def _ad_cursor_key(user_id: int) -> str:
-    return f"ad_cursor:{user_id}"   # 0-based index
-
-async def _fetch_saved_window(app: Client, user_id: int) -> List[int]:
+async def _nudge_join_manually(user_id: int, token: str):
+    if BOT_NOTIFIER is None:  # optional
+        return
+    key = f"join-nudge:{user_id}:{token}"
+    last = int(get_setting(key, 0) or 0)
+    now = int(_time.time())
+    if now - last < JOIN_NUDGE_COOLDOWN_SEC:
+        return
+    set_setting(key, now)
+    txt = (
+        "✇ Manual join required\n"
+        "✇ You added a private invite link as a group target.\n"
+        "✇ I cannot auto-join; please join it manually with your account, then keep the link saved here.\n"
+        f"✇ Link: {token}"
+    )
     try:
-        win = int(get_setting(_ad_window_key(user_id), 200) or 200)
+        await BOT_NOTIFIER.send_message(user_id, txt)
     except Exception:
-        win = 200
-    win = max(1, min(500, win))
+        pass
 
-    ids = []
-    try:
-        async for msg in app.get_chat_history("me", limit=win):
-            # skip dot-commands and empty/service
-            if msg.text and msg.text.strip().startswith("."):
-                continue
-            if not (msg.text or msg.caption or msg.media):
-                continue
-            ids.append(msg.id)
-        ids.reverse()  # oldest → newest
-    except Exception as e:
-        log.error(f"[saved] fetch error: {e}")
-        return []
-    return ids
-
-def _advance_cursor(user_id: int, size: int):
-    try:
-        cur = int(get_setting(_ad_cursor_key(user_id), 0) or 0)
-    except Exception:
-        cur = 0
-    cur = 0 if size <= 0 else (cur + 1) % size
-    set_setting(_ad_cursor_key(user_id), cur)
-    return cur
-
-def _reset_cursor(user_id: int):
-    set_setting(_ad_cursor_key(user_id), 0)
-
-# ---- session wrapper ----
-class SessionNode:
-    def __init__(self, user_id: int, slot: int, api_id: int, api_hash: str, session_string: str):
-        self.user_id = int(user_id)
-        self.slot = int(slot)
-        self.api_id = int(api_id)
-        self.api_hash = str(api_hash)
-        self.session_string = str(session_string)
-        self.app = Client(name=f"sess-u{user_id}-s{slot}", api_id=self.api_id, api_hash=self.api_hash, session_string=self.session_string)
-        self._started = False
-
-    async def start(self):
-        if self._started: return
-        try:
-            await self.app.start()
-            self._bind_handlers()
-            self._started = True
-            log.info(f"[u{self.user_id}s{self.slot}] started")
-        except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
-            await _notify_rehydrate(self.user_id, self.slot, e.__class__.__name__)
-            log.error(f"[u{self.user_id}s{self.slot}] start auth error: {e}")
+# ---------- resolving ----------
+async def resolve_chat(app: Client, token: str):
+    if token.lstrip("-").isdigit():
+        try: return await app.get_chat(int(token))
         except Exception as e:
-            log.error(f"[u{self.user_id}s{self.slot}] start failed: {e}")
-
-    async def stop(self):
-        if not self._started: return
-        try: await self.app.stop()
-        except Exception: pass
-        self._started = False
-        log.info(f"[u{self.user_id}s{self.slot}] stopped")
-
-    # ---- self-commands (from that account) ----
-    def _bind_handlers(self):
-        @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.(help|start)$"))
-        async def _help(_, m):
-            await m.reply_text(
-                "✇ Saved-All mode\n"
-                "• <b>.addgc</b> targets — add @usernames, numeric ids, ANY t.me link (private invites are stored; join manually)\n"
-                "• <b>.gc</b> — list targets\n"
-                "• <b>.time</b> 30m|45m|60m — set interval\n"
-                "• <b>.adreset</b> — restart the Saved-message cycle\n"
-                "✇ Put your ads in <b>Saved Messages</b> — I will cycle through them every interval."
-            )
-
-        @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.gc$"))
-        async def _gc(_, m):
-            gs = list_groups(self.user_id)
-            cap = groups_cap(self.user_id)
-            if not gs:
-                await m.reply_text(f"👥 No targets yet. Cap: {cap}")
-            else:
-                listing = "\n".join(f"• {g}" for g in gs)
-                await m.reply_text(f"👥 Targets ({len(gs)}/{cap})\n{listing}\n✇ Reminder: join private links manually.")
-
-        @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.adreset$"))
-        async def _adreset(_, m):
-            _reset_cursor(self.user_id)
-            await m.reply_text("✅ Saved-message cursor reset.")
-
-        @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.time\s+(.+)$"))
-        async def _time_cmd(_, m):
-            arg = m.matches[0].group(1).strip().lower()
-            if arg.endswith("m"): arg = arg[:-1]
-            try:
-                mins = int(arg)
-            except Exception:
-                await m.reply_text("❌ Use: .time 30m | 45m | 60m"); return
-            if mins not in (30, 45, 60):
-                await m.reply_text("❌ Allowed: 30m, 45m, 60m"); return
-            set_interval(self.user_id, mins)
-            await m.reply_text(f"✅ Interval set to {mins} minutes")
-
-        @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.addgc\s+(.+)$"))
-        async def _addgc(_, m):
-            payload = m.matches[0].group(1)
-            tokens = _normalize_targets(SPLIT_RE.split(payload))
-            if not tokens:
-                await m.reply_text("❌ No valid targets found."); return
-            cap = groups_cap(self.user_id)
-            have = len(list_groups(self.user_id))
-            remain = max(0, cap - have)
-            added = 0
-            for t in tokens:
-                if added >= remain:
-                    break
-                try:
-                    added += add_group(self.user_id, t)
-                except Exception:
-                    pass
-            if added == 0:
-                await m.reply_text(f"ℹ️ Nothing added (cap {cap} or duplicates).")
-            else:
-                await m.reply_text(
-                    f"✅ Added {added} target(s). Now {len(list_groups(self.user_id))}/{cap}.\n"
-                    "✇ Note: private invite links are stored but sending will be skipped until you join."
-                )
-
-    # ---- sender ----
-    async def send_next_saved_to_targets(self, targets: List[str]) -> int:
-        if not self._started:
-            await self.start()
-            if not self._started:
-                return 0
-
-        msg_ids = await _fetch_saved_window(self.app, self.user_id)
-        if not msg_ids:
-            log.info(f"[u{self.user_id}s{self.slot}] no saved items to send")
-            return 0
-
-        try:
-            cur = int(get_setting(_ad_cursor_key(self.user_id), 0) or 0)
-        except Exception:
-            cur = 0
-        if cur < 0 or cur >= len(msg_ids):
-            cur = 0
-        mid = msg_ids[cur]
-
-        try:
-            ad = await self.app.get_messages("me", mid)
+            log.info(f"[resolve] id {token} failed: {e}"); return None
+    m = USERNAME_RE.match(token.lstrip("@"))
+    if m:
+        uname = m.group(1)
+        try: return await app.get_chat(uname)
+        except (UsernameInvalid, UsernameNotOccupied):
+            log.info(f"[resolve] @{uname} invalid/not occupied"); return None
         except Exception as e:
-            log.warning(f"[u{self.user_id}s{self.slot}] get_messages mid={mid} failed: {e}")
-            _advance_cursor(self.user_id, len(msg_ids))
-            return 0
-
-        ok = 0
-        for tgt in targets:
-            # Skip invite links (user must join manually)
-            if _is_invite_link(tgt):
-                log.info(f"[u{self.user_id}s{self.slot}] invite link skipped (join manually): {tgt}")
-                continue
-            try:
-                chat_id = int(tgt) if tgt.lstrip("-").isdigit() else (_extract_username_from_link(tgt) or tgt)
-                await ad.copy(chat_id=chat_id)
-                ok += 1
-                await asyncio.sleep(10)  # 10s per target
-            except FloodWait as fw:
-                log.warning(f"[u{self.user_id}s{self.slot}] FloodWait {fw.value}s — sleeping")
-                await asyncio.sleep(fw.value + 1)
-            except UserNotParticipant:
-                log.info(f"[u{self.user_id}s{self.slot}] not a participant: {tgt} (skipped)")
-            except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
-                await _notify_rehydrate(self.user_id, self.slot, e.__class__.__name__)
-                log.error(f"[u{self.user_id}s{self.slot}] auth error during send: {e}")
-                break
-            except RPCError as e:
-                log.warning(f"[u{self.user_id}s{self.slot}] RPC error on {tgt}: {e}")
+            log.info(f"[resolve] @{uname} failed: {e}"); return None
+    if token.startswith("http"):
+        u = extract_username_from_link(token)
+        if u:
+            try: return await app.get_chat(u)
             except Exception as e:
-                log.warning(f"[u{self.user_id}s{self.slot}] send failed on {tgt}: {e}")
+                log.info(f"[resolve] link→@{u} failed: {e}"); return None
+        # invite link: keep for reminder, but we can’t resolve
+        return None
+    return None
 
-        _advance_cursor(self.user_id, len(msg_ids))
-        return ok
+# ---------- Saved-All cursor ----------
+def _cursor_key(user_id: int, slot: int) -> str:
+    return f"sall:last:{user_id}:{slot}"
 
-# ---- pool / scheduler ----
-class SessionPool:
-    def __init__(self):
-        self.nodes: Dict[tuple, SessionNode] = {}
+async def _get_next_saved_message(app: Client, user_id: int, slot: int):
+    last_id = int(get_setting(_cursor_key(user_id, slot), 0) or 0)
+    msgs = await app.get_history("me", limit=HISTORY_FETCH_LIMIT)
+    if not msgs: return None, last_id
+    candidates = [m for m in msgs if getattr(m, "id", 0) and m.id > last_id]
+    if not candidates: return None, last_id
+    next_msg = min(candidates, key=lambda m: m.id)
+    return next_msg, last_id
 
-    async def refresh(self):
-        present = set()
-        for uid in users_with_sessions():
-            for r in sessions_list(uid):
-                key = (r["user_id"], r["slot"])
-                present.add(key)
-                if key not in self.nodes:
-                    node = SessionNode(r["user_id"], r["slot"], r["api_id"], r["api_hash"], r["session_string"])
-                    self.nodes[key] = node
-                    await node.start()
-        # purge removed
-        for key in list(self.nodes.keys()):
-            if key not in present:
-                try: await self.nodes[key].stop()
-                finally: self.nodes.pop(key, None)
+def _save_cursor(user_id: int, slot: int, msg_id: int):
+    set_setting(_cursor_key(user_id, slot), int(msg_id))
 
-    def pick_node(self, user_id: int) -> Optional[SessionNode]:
-        slots = sorted([slot for (uid, slot) in self.nodes.keys() if uid == user_id])
-        if not slots:
-            return None
-        cfg_key = f"worker:last_session:{user_id}"
+# ---------- sending ----------
+async def _send_saved_to_targets(app: Client, msg, targets: list[str], user_id: int, slot: int) -> int:
+    ok = 0
+    for token in targets:
+        if is_invite_link(token):
+            log.info(f"[u{user_id}] invite link saved; skipping send, nudging user: {token}")
+            await _nudge_join_manually(user_id, token)
+            continue
+
+        chat = await resolve_chat(app, token)
+        if chat is None:
+            log.info(f"[u{user_id}] unresolved/unsupported token: {token}")
+            continue
+
         try:
-            cur = int(get_setting(cfg_key, -1) or -1)
-        except Exception:
-            cur = -1
-        nxt = slots[(slots.index(cur) + 1) % len(slots)] if cur in slots else slots[0]
-        set_setting(cfg_key, nxt)
-        return self.nodes.get((user_id, nxt))
+            await app.copy_message(chat_id=chat.id, from_chat_id="me", message_id=msg.id)
+            ok += 1
+            log.info(f"[u{user_id} s{slot}] sent to {getattr(chat,'username',None) or chat.id} (msg {msg.id})")
+            await asyncio.sleep(SEND_BETWEEN_GROUPS_SEC)
+        except FloodWait as fw:
+            log.warning(f"[u{user_id} s{slot}] FloodWait {fw.value}s on {chat.id}")
+            await asyncio.sleep(fw.value + 1)
+        except UserNotParticipant:
+            log.info(f"[u{user_id}] not a participant in {getattr(chat,'username',None) or chat.id} (NO-JOIN)")
+        except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired) as e:
+            await _notify_rehydrate(user_id, slot, e.__class__.__name__)
+            log.error(f"[u{user_id} s{slot}] auth error on send: {e}")
+        except RPCError as e:
+            log.warning(f"[u{user_id} s{slot}] RPCError on {chat.id}: {e}")
+        except Exception as e:
+            log.warning(f"[u{user_id} s{slot}] send failed on {chat.id}: {e}")
+    return ok
 
-POOL = SessionPool()
-
-async def _tick_user(user_id: int):
-    if night_enabled():
+# ---------- per-user cycle ----------
+async def process_user(user_id: int):
+    # Night / pause
+    if night_enabled() and is_night_now_ist():
+        return
+    if str(get_setting(f"paused:{user_id}", "0")).lower() in ("1","true","yes"):
         return
 
-    gs = list_groups(user_id)
-    if not gs:
-        log.info(f"[u{user_id}] no groups")
-        return
+    # groups
+    groups_raw = list_groups(user_id)
+    targets = normalize_tokens(expand_tokens(groups_raw))
+    if not targets:
+        log.info(f"[u{user_id}] no groups configured"); return
 
-    interval = get_interval(user_id) or 30
-    last_ts = get_last_sent_at(user_id)
-    now = int(datetime.now(timezone.utc).timestamp())
-    if last_ts is not None and now - last_ts < interval * 60:
-        remain = interval * 60 - (now - last_ts)
+    # interval
+    minutes = get_interval(user_id)
+    if not minutes or int(minutes) < 1:
+        minutes = DEFAULT_INTERVAL_MIN
+        set_interval(user_id, minutes)
+        log.info(f"[u{user_id}] interval defaulted to {minutes}m")
+    minutes = int(minutes)
+
+    # schedule gate
+    last_ts = int(get_setting(f"last_sent_at:{user_id}", 0) or 0)
+    now = int(datetime.utcnow().timestamp())
+    if last_ts and (now - last_ts) < minutes * 60:
+        remain = minutes * 60 - (now - last_ts)
         log.info(f"[u{user_id}] not due yet ({remain}s left)")
         return
 
-    node = POOL.pick_node(user_id)
-    if not node:
-        log.info(f"[u{user_id}] no live sessions")
+    # session
+    sessions = sessions_strings(user_id)
+    if not sessions:
+        log.info(f"[u{user_id}] no sessions"); return
+    idx = _choose_session_index(user_id, len(sessions))
+    sess = sessions[idx]; slot = int(sess["slot"])
+
+    app = Client(
+        name=f"user-{user_id}-s{slot}",
+        api_id=int(sess["api_id"]), api_hash=str(sess["api_hash"]),
+        session_string=str(sess["session_string"])
+    )
+    try:
+        await app.start()
+    except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired) as e:
+        await _notify_rehydrate(user_id, slot, e.__class__.__name__)
+        log.error(f"[u{user_id} s{slot}] start auth error: {e}")
+        return
+    except Exception as e:
+        log.error(f"[u{user_id} s{slot}] start failed: {e}")
         return
 
-    sent = await node.send_next_saved_to_targets(gs)
-    if sent > 0:
-        mark_sent_now(user_id)
-        inc_sent_ok(user_id, sent)
-        log.info(f"[u{user_id}] sent_ok+={sent}")
-    else:
-        log.info(f"[u{user_id}] nothing sent this tick")
+    try:
+        next_msg, _ = await _get_next_saved_message(app, user_id, slot)
+        if not next_msg:
+            log.info(f"[u{user_id} s{slot}] no new Saved Messages to send")
+            return
 
-async def scheduler_loop():
+        sent = await _send_saved_to_targets(app, next_msg, targets, user_id, slot)
+        if sent > 0:
+            _save_cursor(user_id, slot, next_msg.id)
+            set_setting(f"last_sent_at:{user_id}", int(datetime.utcnow().timestamp()))
+            mark_sent_now(user_id); inc_sent_ok(user_id, sent)
+            log.info(f"[u{user_id}] sent_ok += {sent}")
+        else:
+            log.info(f"[u{user_id}] nothing sent this tick")
+    finally:
+        try: await app.stop()
+        except Exception: pass
+
+# ---------- loop ----------
+async def main_loop():
+    init_db()
+    log.info("[worker] started (Saved-All mode, 30m default, 15s scan)")
     while True:
         try:
-            await POOL.refresh()
             for uid in users_with_sessions():
                 try:
-                    await _tick_user(uid)
+                    await process_user(uid)
                 except Exception as e:
-                    log.error(f"[u{uid}] tick error: {e}")
+                    log.error(f"[u{uid}] process error: {e}")
                 await asyncio.sleep(0.2)
         except Exception as e:
             log.error(f"[loop] error: {e}")
-        await asyncio.sleep(10)
+        await asyncio.sleep(SCAN_PERIOD_SEC)
 
 async def main():
-    init_db()
-    await scheduler_loop()
+    await main_loop()
 
 if __name__ == "__main__":
     asyncio.run(main())
