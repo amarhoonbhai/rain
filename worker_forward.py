@@ -1,44 +1,52 @@
-# worker_forward.py — persistent session hub (scheduler + account commands)
-# Features:
-#  • Persistent Pyrogram client per session (handles .addgc, .time, .gc, .help)
-#  • Scheduler per user_id (30/45/60) → send to all groups with 10s gaps
-#  • Ad source: pinned message in "Saved Messages" (text or media; media is copied)
-#  • No auto-join; stores whatever targets user gives (username / numeric id / links)
-#  • Night mode respected; stats updated; auto rehydrate notify via MAIN_BOT_TOKEN (optional)
+# worker_forward.py — Saved-All mode (round-robin over your Saved Messages)
+# At each interval:
+#   1) Pick the next message from your "Saved Messages" (oldest→newest, round-robin)
+#   2) Copy it to every saved target (10s delay per target)
+# Commands (send from the logged-in account):
+#   .help            — show usage
+#   .addgc …         — add targets (@usernames, numeric ids, ANY t.me link incl. private)
+#   .gc              — list saved targets
+#   .time 30m|45m|60m — set interval
+#   .adreset         — reset Saved-message cursor to the first item
+#
+# Requires core.db:
+#   init_db(), users_with_sessions(), sessions_list(),
+#   list_groups(), add_group(), groups_cap(),
+#   get_interval(), set_interval(),
+#   get_last_sent_at(), mark_sent_now(), inc_sent_ok(),
+#   night_enabled(), set_setting(), get_setting()
 
 import os, asyncio, logging, re, time as _time
-from typing import Dict, Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from aiogram import Bot  # only used for DM notifications on auth issues
+from aiogram import Bot  # for optional DM notifier
 
 from pyrogram import Client, filters
-from pyrogram.errors import (
-    FloodWait, RPCError, Unauthorized, AuthKeyUnregistered
-)
+from pyrogram.errors import FloodWait, RPCError, Unauthorized, AuthKeyUnregistered
 try:
     from pyrogram.errors import SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan, UserNotParticipant
-except Exception:  # keep compatibility across minor versions
+except Exception:
     class _E(Exception): pass
     SessionRevoked = SessionExpired = UserDeactivated = UserDeactivatedBan = UserNotParticipant = _E
 
 from core.db import (
     init_db,
     users_with_sessions, sessions_list,
-    list_groups, add_group, clear_groups, groups_cap,
+    list_groups, add_group, groups_cap,
     get_interval, set_interval,
     get_last_sent_at, mark_sent_now, inc_sent_ok,
-    night_enabled, set_setting, get_setting
+    night_enabled, set_setting, get_setting,
 )
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("worker")
 
-# ---------- Optional notifier (owner bot DM on session auth errors) ----------
+# Optional DM notifier for session problems
 BOT_TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 BOT_NOTIFIER = Bot(BOT_TOKEN) if BOT_TOKEN and ":" in BOT_TOKEN else None
-AUTH_PING_COOLDOWN_SEC = 6 * 3600  # 6 hours
+AUTH_PING_COOLDOWN_SEC = 6 * 3600
 
 async def _notify_rehydrate(user_id: int, slot: int, reason: str):
     if BOT_NOTIFIER is None:
@@ -53,23 +61,24 @@ async def _notify_rehydrate(user_id: int, slot: int, reason: str):
         await BOT_NOTIFIER.send_message(
             user_id,
             "✇ Session issue detected\n"
-            f"✇ Slot <b>{slot}</b> looks <b>expired/unauthorized</b>.\n"
-            "✇ Log in again via <b>@SpinifyLoginBot</b>.\n"
+            f"✇ Slot <b>{slot}</b> unauthorized/expired.\n"
+            "✇ Re-login via <b>@SpinifyLoginBot</b>.\n"
             f"✇ Reason: <code>{reason}</code>"
         )
     except Exception:
         pass
 
-# ---------- Target normalization ----------
+# ---- target parsing ----
 SPLIT_RE = re.compile(r"[,\n\r\t ]+")
 USERNAME_RE = re.compile(r"^@?([A-Za-z0-9_]{5,})$")
 
 def _extract_username_from_link(s: str) -> Optional[str]:
+    # Convert t.me/username → username. Keep invite links as-is (we can’t send to them).
     if not s.startswith("http"): return None
     u = urlparse(s)
     if u.netloc.lower() != "t.me": return None
     path = u.path.strip("/")
-    if not path or path.startswith("+") or path.startswith("joinchat"):  # private invite → keep as-is
+    if not path or path.startswith("+") or path.startswith("joinchat"):
         return None
     uname = path.split("/")[0]
     return uname if USERNAME_RE.match(uname) else None
@@ -78,28 +87,70 @@ def _normalize_targets(chunks: List[str]) -> List[str]:
     out, seen = [], set()
     for raw in chunks:
         t = (raw or "").strip().rstrip("/.,")
-        if not t: continue
+        if not t:
+            continue
         if t.lstrip("-").isdigit():
             key = t
         else:
             m = USERNAME_RE.match(t.lstrip("@"))
             if m:
-                key = m.group(1)  # store username w/o @
+                key = m.group(1)                 # clean @
             else:
                 u = _extract_username_from_link(t)
-                key = u if u else t  # store raw link for private invites
+                key = u if u else t              # keep private invite link string
         if key and key not in seen:
             seen.add(key); out.append(key)
     return out
 
-# ---------- Ad (pinned) fetch ----------
-async def _find_pinned_in_saved(app: Client):
-    async for msg in app.get_chat_history("me", limit=200):
-        if getattr(msg, "pinned", False):
-            return msg
-    return None
+def _is_invite_link(t: str) -> bool:
+    if not t.startswith("http"): return False
+    u = urlparse(t)
+    if u.netloc.lower() != "t.me": return False
+    p = u.path.strip("/")
+    return (p.startswith("+") or p.startswith("joinchat"))
 
-# ---------- Session Node ----------
+# ---- saved messages window / cursor ----
+def _ad_window_key(user_id: int) -> str:
+    return f"ad_window:{user_id}"   # latest N to consider (default 200)
+
+def _ad_cursor_key(user_id: int) -> str:
+    return f"ad_cursor:{user_id}"   # 0-based index
+
+async def _fetch_saved_window(app: Client, user_id: int) -> List[int]:
+    try:
+        win = int(get_setting(_ad_window_key(user_id), 200) or 200)
+    except Exception:
+        win = 200
+    win = max(1, min(500, win))
+
+    ids = []
+    try:
+        async for msg in app.get_chat_history("me", limit=win):
+            # skip dot-commands and empty/service
+            if msg.text and msg.text.strip().startswith("."):
+                continue
+            if not (msg.text or msg.caption or msg.media):
+                continue
+            ids.append(msg.id)
+        ids.reverse()  # oldest → newest
+    except Exception as e:
+        log.error(f"[saved] fetch error: {e}")
+        return []
+    return ids
+
+def _advance_cursor(user_id: int, size: int):
+    try:
+        cur = int(get_setting(_ad_cursor_key(user_id), 0) or 0)
+    except Exception:
+        cur = 0
+    cur = 0 if size <= 0 else (cur + 1) % size
+    set_setting(_ad_cursor_key(user_id), cur)
+    return cur
+
+def _reset_cursor(user_id: int):
+    set_setting(_ad_cursor_key(user_id), 0)
+
+# ---- session wrapper ----
 class SessionNode:
     def __init__(self, user_id: int, slot: int, api_id: int, api_hash: str, session_string: str):
         self.user_id = int(user_id)
@@ -125,37 +176,38 @@ class SessionNode:
 
     async def stop(self):
         if not self._started: return
-        try:
-            await self.app.stop()
-        except Exception:
-            pass
+        try: await self.app.stop()
+        except Exception: pass
         self._started = False
         log.info(f"[u{self.user_id}s{self.slot}] stopped")
 
-    # -------- Account-side commands --------
+    # ---- self-commands (from that account) ----
     def _bind_handlers(self):
         @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.(help|start)$"))
         async def _help(_, m):
-            txt = (
-                "✇ Commands\n"
-                "• <b>.addgc</b> <i>one-per-line or space separated</i>\n"
-                "    Save public/private links or @usernames or numeric IDs (max depends on your plan).\n"
-                "• <b>.gc</b> — show saved targets\n"
+            await m.reply_text(
+                "✇ Saved-All mode\n"
+                "• <b>.addgc</b> targets — add @usernames, numeric ids, ANY t.me link (private invites are stored; join manually)\n"
+                "• <b>.gc</b> — list targets\n"
                 "• <b>.time</b> 30m|45m|60m — set interval\n"
-                "• <b>.help</b> — show this help\n\n"
-                "✇ Ads are taken from your <b>pinned Saved Message</b> (text or media)."
+                "• <b>.adreset</b> — restart the Saved-message cycle\n"
+                "✇ Put your ads in <b>Saved Messages</b> — I will cycle through them every interval."
             )
-            await m.reply_text(txt)
 
         @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.gc$"))
         async def _gc(_, m):
             gs = list_groups(self.user_id)
             cap = groups_cap(self.user_id)
             if not gs:
-                await m.reply_text(f"👥 No groups saved yet. Cap: {cap}")
+                await m.reply_text(f"👥 No targets yet. Cap: {cap}")
             else:
                 listing = "\n".join(f"• {g}" for g in gs)
-                await m.reply_text(f"👥 Groups ({len(gs)}/{cap})\n{listing}")
+                await m.reply_text(f"👥 Targets ({len(gs)}/{cap})\n{listing}\n✇ Reminder: join private links manually.")
+
+        @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.adreset$"))
+        async def _adreset(_, m):
+            _reset_cursor(self.user_id)
+            await m.reply_text("✅ Saved-message cursor reset.")
 
         @self.app.on_message(filters.me & filters.text & filters.regex(r"(?i)^\.time\s+(.+)$"))
         async def _time_cmd(_, m):
@@ -166,7 +218,7 @@ class SessionNode:
             except Exception:
                 await m.reply_text("❌ Use: .time 30m | 45m | 60m"); return
             if mins not in (30, 45, 60):
-                await m.reply_text("❌ Allowed intervals: 30m, 45m, 60m"); return
+                await m.reply_text("❌ Allowed: 30m, 45m, 60m"); return
             set_interval(self.user_id, mins)
             await m.reply_text(f"✅ Interval set to {mins} minutes")
 
@@ -190,47 +242,54 @@ class SessionNode:
             if added == 0:
                 await m.reply_text(f"ℹ️ Nothing added (cap {cap} or duplicates).")
             else:
-                await m.reply_text(f"✅ Added {added} target(s). Now {len(list_groups(self.user_id))}/{cap}.")
+                await m.reply_text(
+                    f"✅ Added {added} target(s). Now {len(list_groups(self.user_id))}/{cap}.\n"
+                    "✇ Note: private invite links are stored but sending will be skipped until you join."
+                )
 
-    # -------- Send API used by scheduler --------
-    async def send_pinned_to_targets(self, targets: List[str]) -> int:
-        """
-        Send pinned Saved Message to each target with 10s gaps.
-        Supports text or media by copying the pinned message.
-        Returns number of successful sends.
-        """
+    # ---- sender ----
+    async def send_next_saved_to_targets(self, targets: List[str]) -> int:
         if not self._started:
             await self.start()
             if not self._started:
                 return 0
 
-        pinned = await _find_pinned_in_saved(self.app)
-        if not pinned:
-            log.info(f"[u{self.user_id}s{self.slot}] no pinned message in Saved Messages")
+        msg_ids = await _fetch_saved_window(self.app, self.user_id)
+        if not msg_ids:
+            log.info(f"[u{self.user_id}s{self.slot}] no saved items to send")
+            return 0
+
+        try:
+            cur = int(get_setting(_ad_cursor_key(self.user_id), 0) or 0)
+        except Exception:
+            cur = 0
+        if cur < 0 or cur >= len(msg_ids):
+            cur = 0
+        mid = msg_ids[cur]
+
+        try:
+            ad = await self.app.get_messages("me", mid)
+        except Exception as e:
+            log.warning(f"[u{self.user_id}s{self.slot}] get_messages mid={mid} failed: {e}")
+            _advance_cursor(self.user_id, len(msg_ids))
             return 0
 
         ok = 0
         for tgt in targets:
+            # Skip invite links (user must join manually)
+            if _is_invite_link(tgt):
+                log.info(f"[u{self.user_id}s{self.slot}] invite link skipped (join manually): {tgt}")
+                continue
             try:
-                # Resolve chat id: username (without @), numeric id, or private invite link
-                chat_id = None
-                if tgt.lstrip("-").isdigit():
-                    chat_id = int(tgt)
-                else:
-                    if tgt.startswith("http"):
-                        u = _extract_username_from_link(tgt)
-                        chat_id = u if u else tgt   # allow private invite link (will error if not a member)
-                    else:
-                        chat_id = tgt  # bare username without @
-
-                await pinned.copy(chat_id=chat_id)
+                chat_id = int(tgt) if tgt.lstrip("-").isdigit() else (_extract_username_from_link(tgt) or tgt)
+                await ad.copy(chat_id=chat_id)
                 ok += 1
-                await asyncio.sleep(10)  # 10s gap per target
+                await asyncio.sleep(10)  # 10s per target
             except FloodWait as fw:
-                log.warning(f"[u{self.user_id}s{self.slot}] FloodWait {fw.value}s; sleeping…")
+                log.warning(f"[u{self.user_id}s{self.slot}] FloodWait {fw.value}s — sleeping")
                 await asyncio.sleep(fw.value + 1)
             except UserNotParticipant:
-                log.info(f"[u{self.user_id}s{self.slot}] not a participant for {tgt} (skipped)")
+                log.info(f"[u{self.user_id}s{self.slot}] not a participant: {tgt} (skipped)")
             except (Unauthorized, AuthKeyUnregistered, SessionRevoked, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
                 await _notify_rehydrate(self.user_id, self.slot, e.__class__.__name__)
                 log.error(f"[u{self.user_id}s{self.slot}] auth error during send: {e}")
@@ -240,15 +299,15 @@ class SessionNode:
             except Exception as e:
                 log.warning(f"[u{self.user_id}s{self.slot}] send failed on {tgt}: {e}")
 
+        _advance_cursor(self.user_id, len(msg_ids))
         return ok
 
-# ---------- Pool of sessions ----------
+# ---- pool / scheduler ----
 class SessionPool:
     def __init__(self):
-        self.nodes: Dict[tuple, SessionNode] = {}  # (user_id, slot) -> node
+        self.nodes: Dict[tuple, SessionNode] = {}
 
     async def refresh(self):
-        """Start new nodes for new sessions; stop nodes no longer present."""
         present = set()
         for uid in users_with_sessions():
             for r in sessions_list(uid):
@@ -258,36 +317,36 @@ class SessionPool:
                     node = SessionNode(r["user_id"], r["slot"], r["api_id"], r["api_hash"], r["session_string"])
                     self.nodes[key] = node
                     await node.start()
-
-        # stop removed
+        # purge removed
         for key in list(self.nodes.keys()):
             if key not in present:
-                try:
-                    await self.nodes[key].stop()
-                finally:
-                    self.nodes.pop(key, None)
+                try: await self.nodes[key].stop()
+                finally: self.nodes.pop(key, None)
 
     def pick_node(self, user_id: int) -> Optional[SessionNode]:
-        # round-robin across available slots for this user
         slots = sorted([slot for (uid, slot) in self.nodes.keys() if uid == user_id])
         if not slots:
             return None
-        set_key = f"worker:last_session:{user_id}"
-        cur = int(get_setting(set_key, -1) or -1)
+        cfg_key = f"worker:last_session:{user_id}"
+        try:
+            cur = int(get_setting(cfg_key, -1) or -1)
+        except Exception:
+            cur = -1
         nxt = slots[(slots.index(cur) + 1) % len(slots)] if cur in slots else slots[0]
-        set_setting(set_key, nxt)
+        set_setting(cfg_key, nxt)
         return self.nodes.get((user_id, nxt))
 
 POOL = SessionPool()
 
-# ---------- Scheduler ----------
 async def _tick_user(user_id: int):
     if night_enabled():
         return
+
     gs = list_groups(user_id)
     if not gs:
         log.info(f"[u{user_id}] no groups")
         return
+
     interval = get_interval(user_id) or 30
     last_ts = get_last_sent_at(user_id)
     now = int(datetime.now(timezone.utc).timestamp())
@@ -301,7 +360,7 @@ async def _tick_user(user_id: int):
         log.info(f"[u{user_id}] no live sessions")
         return
 
-    sent = await node.send_pinned_to_targets(gs)
+    sent = await node.send_next_saved_to_targets(gs)
     if sent > 0:
         mark_sent_now(user_id)
         inc_sent_ok(user_id, sent)
@@ -318,12 +377,11 @@ async def scheduler_loop():
                     await _tick_user(uid)
                 except Exception as e:
                     log.error(f"[u{uid}] tick error: {e}")
-                await asyncio.sleep(0.2)  # light pacing across users
+                await asyncio.sleep(0.2)
         except Exception as e:
             log.error(f"[loop] error: {e}")
-        await asyncio.sleep(10)  # main loop cadence
+        await asyncio.sleep(10)
 
-# ---------- Entrypoint ----------
 async def main():
     init_db()
     await scheduler_loop()
