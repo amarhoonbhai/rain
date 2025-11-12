@@ -1,32 +1,51 @@
-# run_all.py — start main bot, worker, login bot (optional), enforcer
-import asyncio, os
-from dotenv import load_dotenv
-load_dotenv()
+# profile_enforcer.py — enforce name/bio unless premium
+import asyncio, logging
+from pyrogram import Client
+from core.db import get_conn, init_db, is_premium
 
-async def serve_bot():
-    import main_bot
-    await main_bot.main()
+logging.basicConfig(level="INFO")
+log = logging.getLogger("enforcer")
 
-async def serve_worker():
-    import worker_forward
-    await worker_forward.main()
+BIO = "#1 Free Ads Bot — Join @PhiloBots"
+NAME_SUFFIX = " — via @SpinifyAdsBot"
 
-async def serve_login_bot():
-    token = (os.getenv("LOGIN_BOT_TOKEN") or "").strip()
-    if not token or ":" not in token:
-        print("[login-bot] LOGIN_BOT_TOKEN not set — skipping.")
-        while True:
-            await asyncio.sleep(3600)
-    import login_bot
-    await login_bot.login_bot_main()
+def load_accounts():
+    conn = get_conn()
+    rows = conn.execute("SELECT user_id, api_id, api_hash, session_string FROM sessions").fetchall()
+    conn.close()
+    return rows
 
-async def serve_enforcer():
-    import profile_enforcer
-    await profile_enforcer.main()
+async def enforce_once(user_id, api_id, api_hash, session_string):
+    if is_premium(user_id):
+        log.info(f"u{user_id}: premium — skip enforce")
+        return
+    app = Client(name=f"enf-{user_id}", api_id=api_id, api_hash=api_hash, session_string=session_string)
+    try:
+        await app.start()
+        me = await app.get_me()
+        try:
+            await app.update_profile(bio=BIO)
+        except Exception:
+            pass
+        try:
+            base = (me.first_name or "User").split(" — ")[0]
+            if not (me.first_name or "").endswith(NAME_SUFFIX):
+                await app.update_profile(first_name=base + NAME_SUFFIX)
+        except Exception:
+            pass
+    except Exception as e:
+        log.error(f"u{user_id}: enforce failed: {e}")
+    finally:
+        try: await app.stop()
+        except Exception: pass
 
 async def main():
-    tasks = [serve_bot(), serve_worker(), serve_login_bot(), serve_enforcer()]
-    await asyncio.gather(*tasks)
+    init_db()
+    while True:
+        for r in load_accounts():
+            await enforce_once(r["user_id"], r["api_id"], r["api_hash"], r["session_string"])
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(300)
 
 if __name__ == "__main__":
     asyncio.run(main())
