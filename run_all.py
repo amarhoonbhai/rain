@@ -1,51 +1,103 @@
-# profile_enforcer.py — enforce name/bio unless premium
-import asyncio, logging
-from pyrogram import Client
-from core.db import get_conn, init_db, is_premium
+# run_all.py — resilient supervisor for main_bot, worker_forward, login_bot, profile_enforcer
+import asyncio, logging, os, signal, contextlib, traceback
+from datetime import datetime
+from dotenv import load_dotenv
 
-logging.basicConfig(level="INFO")
-log = logging.getLogger("enforcer")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("supervisor")
 
-BIO = "#1 Free Ads Bot — Join @PhiloBots"
-NAME_SUFFIX = " — via @SpinifyAdsBot"
+load_dotenv()
+MAIN_BOT_TOKEN  = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+LOGIN_BOT_TOKEN = (os.getenv("LOGIN_BOT_TOKEN") or "").strip()
+ENFORCER_ENABLED = os.getenv("ENFORCER_ENABLED", "1").strip() not in ("0","false","False","")
 
-def load_accounts():
-    conn = get_conn()
-    rows = conn.execute("SELECT user_id, api_id, api_hash, session_string FROM sessions").fetchall()
-    conn.close()
-    return rows
-
-async def enforce_once(user_id, api_id, api_hash, session_string):
-    if is_premium(user_id):
-        log.info(f"u{user_id}: premium — skip enforce")
-        return
-    app = Client(name=f"enf-{user_id}", api_id=api_id, api_hash=api_hash, session_string=session_string)
-    try:
-        await app.start()
-        me = await app.get_me()
+async def _run_forever(name: str, starter):
+    backoff = 3
+    while True:
         try:
-            await app.update_profile(bio=BIO)
-        except Exception:
-            pass
+            log.info(f"[{name}] starting…")
+            await starter()
+            log.warning(f"[{name}] returned; restarting in {backoff}s…")
+        except asyncio.CancelledError:
+            log.info(f"[{name}] cancelled — shutting down.")
+            raise
+        except Exception as e:
+            log.error(f"[{name}] crashed: {e}\n{traceback.format_exc()}")
+            log.info(f"[{name}] restarting in {backoff}s…")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+async def serve_bot():
+    import main_bot
+    await main_bot.main()
+
+async def serve_worker():
+    import worker_forward
+    entry = getattr(worker_forward, "main", None) or getattr(worker_forward, "main_loop", None)
+    if entry is None:
+        raise RuntimeError("worker_forward has no main()/main_loop()")
+    await entry()
+
+async def serve_login_bot():
+    if not (LOGIN_BOT_TOKEN and ":" in LOGIN_BOT_TOKEN):
+        log.info("[login-bot] LOGIN_BOT_TOKEN not set — skipping.")
+        while True:  # placeholder idle task
+            await asyncio.sleep(3600)
+    import login_bot
+    entry = getattr(login_bot, "login_bot_main", None) or getattr(login_bot, "main", None)
+    if entry is None:
+        raise RuntimeError("login_bot has no login_bot_main()/main()")
+    await entry()
+
+async def serve_enforcer():
+    if not ENFORCER_ENABLED:
+        log.info("[enforcer] disabled — skipping.")
+        while True:
+            await asyncio.sleep(3600)
+    import profile_enforcer
+    await profile_enforcer.main()
+
+async def heartbeat(stop_event: asyncio.Event):
+    n = 0
+    while not stop_event.is_set():
+        n += 1
+        log.info(f"[hb] alive #{n} @ {datetime.utcnow().isoformat()}Z")
         try:
-            base = (me.first_name or "User").split(" — ")[0]
-            if not (me.first_name or "").endswith(NAME_SUFFIX):
-                await app.update_profile(first_name=base + NAME_SUFFIX)
-        except Exception:
+            await asyncio.wait_for(stop_event.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
             pass
-    except Exception as e:
-        log.error(f"u{user_id}: enforce failed: {e}")
-    finally:
-        try: await app.stop()
-        except Exception: pass
 
 async def main():
-    init_db()
-    while True:
-        for r in load_accounts():
-            await enforce_once(r["user_id"], r["api_id"], r["api_hash"], r["session_string"])
-            await asyncio.sleep(0.5)
-        await asyncio.sleep(300)
+    if not (MAIN_BOT_TOKEN and ":" in MAIN_BOT_TOKEN):
+        raise RuntimeError("MAIN_BOT_TOKEN missing/malformed in .env")
+
+    stop_event = asyncio.Event()
+
+    def _sig_handler(sig, frame):
+        log.info(f"[svc] got signal {sig}, shutting down…")
+        stop_event.set()
+
+    for s in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(Exception):
+            signal.signal(s, _sig_handler)
+
+    tasks = [
+        asyncio.create_task(_run_forever("main-bot",  lambda: serve_bot())),
+        asyncio.create_task(_run_forever("worker",    lambda: serve_worker())),
+        asyncio.create_task(_run_forever("login-bot", lambda: serve_login_bot())),
+        asyncio.create_task(_run_forever("enforcer",  lambda: serve_enforcer())),
+        asyncio.create_task(heartbeat(stop_event)),
+    ]
+
+    await stop_event.wait()
+    for t in tasks: t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
