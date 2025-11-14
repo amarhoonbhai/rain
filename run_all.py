@@ -1,185 +1,138 @@
 #!/usr/bin/env python3
-# run_all.py — unified process runner (async, restart-safe)
-# Starts: main-bot, login-bot, worker, enforcer
-# Flags:
-#   --only main,login,worker,enforcer   # run subset
-#   --skip login                        # skip some
-#   --hb 30                             # heartbeat seconds (default 30)
-#   --no-env                            # don’t load .env
+# run_all.py — unified runner for:
+#   • main-bot       (SpinifyAdsBot main UI)
+#   • login-bot      (SpinifyLoginBot — session creator)
+#   • worker_forward (Saved-All forward worker)
+#   • profile_enforcer (bio/name enforcer)
 #
-# Console banner (quick help) shows all user-commands exposed by the bots.
+# Features:
+#   • Per-component restart loop with exponential backoff
+#   • Clear logs: [runner] [component ] message
+#   • Graceful shutdown on Ctrl+C / SIGTERM
+#   • Heartbeat log every 30s
 
-import asyncio, argparse, importlib, os, signal, sys, time
-from contextlib import suppress
+import asyncio
+import importlib
+import logging
+import signal
+from datetime import datetime
 
-BANNER = """\
-────────────────────────────────────────────────────────────────
-Spinify Runner — services: main-bot, login-bot, worker, enforcer
+LOG_LEVEL = "INFO"
 
-User commands (from your logged-in account via userbot):
-  .help          — show all cmds
-  .addgc         — send up to 5 links/IDs/usernames (one per line)
-  .gc            — list targets
-  .cleargc       — clear targets
-  .time 30m|45m|60m — set interval (default 30m)
-  .adreset       — restart Saved-All sequence
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+log = logging.getLogger("runner")
 
-Main bot commands (everyone):
-  /start  /fstats
-Owner commands:
-  /stats  /top N  /broadcast <text>
-Owner panel (inline):
-  🌙 Night toggle, 📊 Stats, 🏆 Top, 📣 Broadcast, 💎 Premium
-Unlock:
-  “Unlock GC” button → raises cap from 5 → 10
-Premium (owner upgrade):
-  cap 50 + name-lock
 
-Tips:
-  • Ensure MONGO_URI + tokens in .env
-  • One instance per bot token (avoid TelegramConflictError)
-────────────────────────────────────────────────────────────────
-"""
+def _ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-SERVICES = {
-    "main":     ("main_bot",          "main"),
-    "login":    ("login_bot",         "login_bot_main"),  # defined in your file
-    "worker":   ("worker_forward",    "main"),
-    "enforcer": ("profile_enforcer",  "main"),
+
+def _l(label: str, msg: str):
+    """Compact aligned label logger."""
+    print(f"{_ts()} [runner] [{label:<10}] {msg}", flush=True)
+
+
+# component_name -> (module, coroutine_attr)
+COMPONENTS = {
+    "main-bot": ("main_bot", "main"),              # aiogram UI bot
+    "login-bot": ("login_bot", "login_bot_main"),  # login bot wrapper
+    "worker": ("worker_forward", "main"),          # forwarder
+    "enforcer": ("profile_enforcer", "main"),      # profile/bio enforcer
 }
 
-def _log(msg, *a):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} [runner] {msg % a if a else msg}", flush=True)
 
-def _env_or(name, default=None):
-    v = os.getenv(name)
-    return v if v is not None else default
-
-async def _sleep_n(n):
-    try:
-        await asyncio.sleep(n)
-    except asyncio.CancelledError:
-        pass
-
-async def _run_forever(tag: str, module_name: str, coro_name: str):
+async def _run_component(name: str, stop_event: asyncio.Event):
     """
-    Import module lazily, run its async entrypoint forever (with backoff on crash).
+    Generic supervisor loop for a single component.
+    Imports the module, gets the entry coroutine, runs it,
+    restarts on crash with exponential backoff.
     """
-    delay = 2
-    while True:
-        _log("[%-10s] starting…", tag)
+    module_name, attr_name = COMPONENTS[name]
+    backoff = 6  # seconds, will grow up to 60
+
+    while not stop_event.is_set():
+        _l(name, "starting…")
+
+        # Import step (can fail e.g. MONGO_URI / core.db issues)
         try:
             mod = importlib.import_module(module_name)
+            fn = getattr(mod, attr_name, None)
+            if fn is None:
+                # fallback: some modules only define main()
+                fn = getattr(mod, "main")
         except Exception as e:
-            _log("[%-10s] import failed: %s", tag, e)
-            await _sleep_n(delay)
-            delay = min(60, delay * 2)
+            _l(name, f"import failed: {e}")
+            if stop_event.is_set():
+                break
+            _l(name, f"restarting in {backoff}s…")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
             continue
 
+        # Run the component
         try:
-            coro = getattr(mod, coro_name, None)
-            if coro is None or not callable(coro):
-                raise RuntimeError(f"{module_name}.{coro_name} not found")
+            await fn()
+            # If it returns cleanly, treat as crash (bots normally run forever)
+            if stop_event.is_set():
+                break
+            _l(name, "exited unexpectedly; treating as crash")
+        except asyncio.CancelledError:
+            _l(name, "cancelled — stopping")
+            break
         except Exception as e:
-            _log("[%-10s] bad entrypoint: %s", tag, e)
-            await _sleep_n(delay)
-            delay = min(60, delay * 2)
-            continue
+            _l(name, f"crashed: {e}")
 
-        try:
-            await coro()  # block until stopped/crashed
-            _log("[%-10s] exited cleanly — restarting in %ss…", tag, delay)
-        except Exception as e:
-            _log("[%-10s] crashed: %s", tag, e)
+        if stop_event.is_set():
+            break
 
-        await _sleep_n(delay)
-        delay = min(60, delay * 2)
+        _l(name, f"restarting in {backoff}s…")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)
 
-async def _heartbeat(period: int):
-    i = 0
-    while True:
-        i += 1
-        _log("[hb] alive #%d", i)
-        await _sleep_n(period)
+    _l(name, "stopped.")
 
-def _want(tag: str, only_set, skip_set):
-    if only_set and tag not in only_set: return False
-    if tag in skip_set: return False
-    return True
 
-def _env_check():
-    miss = []
-    for k in ("MONGO_URI", "MAIN_BOT_TOKEN", "LOGIN_BOT_TOKEN", "OWNER_ID"):
-        if not os.getenv(k):
-            miss.append(k)
-    if miss:
-        _log("WARN env missing: %s", ", ".join(miss))
-        _log("Hint: create .env with MONGO_URI, MAIN_BOT_TOKEN, LOGIN_BOT_TOKEN, OWNER_ID")
+async def _heartbeat(stop_event: asyncio.Event, interval: int = 30):
+    """Simple alive ticker."""
+    n = 0
+    while not stop_event.is_set():
+        n += 1
+        _l("hb", f"alive #{n}")
+        await asyncio.sleep(interval)
+    _l("hb", "stopped.")
+
 
 async def main():
-    ap = argparse.ArgumentParser(description="Spinify async runner")
-    ap.add_argument("--only", help="comma list: main,login,worker,enforcer", default="")
-    ap.add_argument("--skip", help="comma list to skip", default="")
-    ap.add_argument("--hb",   help="heartbeat seconds", type=int, default=int(_env_or("RUN_HB_SEC", "30")))
-    ap.add_argument("--no-env", action="store_true", help="don’t load .env")
-    args = ap.parse_args()
-
-    # Load .env early unless skipped
-    if not args.no_env:
-        with suppress(Exception):
-            from dotenv import load_dotenv
-            load_dotenv()
-
-    print(BANNER, flush=True)
-    _env_check()
-
-    only_set = {p.strip() for p in args.only.split(",") if p.strip()} if args.only else set()
-    skip_set = {p.strip() for p in args.skip.split(",") if p.strip()} if args.skip else set()
-
-    tasks = []
-    # Start with a tiny staggering to reduce initial Bot API conflicts
-    if _want("main", only_set, skip_set):
-        tasks.append(asyncio.create_task(_run_forever("main-bot", *SERVICES["main"])))
-        await _sleep_n(1.0)
-    if _want("login", only_set, skip_set):
-        tasks.append(asyncio.create_task(_run_forever("login-bot", *SERVICES["login"])))
-        await _sleep_n(1.0)
-    if _want("worker", only_set, skip_set):
-        tasks.append(asyncio.create_task(_run_forever("worker", *SERVICES["worker"])))
-        await _sleep_n(1.0)
-    if _want("enforcer", only_set, skip_set):
-        tasks.append(asyncio.create_task(_run_forever("enforcer", *SERVICES["enforcer"])))
-
-    # Heartbeat
-    if args.hb > 0:
-        tasks.append(asyncio.create_task(_heartbeat(args.hb)))
-
-    # Graceful shutdown on SIGINT/SIGTERM
-    stop = asyncio.Event()
-
-    def _sig(*_):
-        _log("received SIGINT/SIGTERM — shutting down…")
-        stop.set()
-
+    stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for s in (signal.SIGINT, signal.SIGTERM):
-        with suppress(NotImplementedError):
-            loop.add_signal_handler(s, _sig)
 
-    await stop.wait()
+    # graceful shutdown
+    def _on_signal(sig):
+        _l("runner", f"received {sig.name} — shutting down…")
+        stop_event.set()
+
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(s, _on_signal, s)
+        except NotImplementedError:
+            # On some platforms (e.g. Windows) signals may not be available
+            pass
+
+    # spawn tasks
+    tasks = []
+    for comp in ("main-bot", "login-bot", "worker", "enforcer"):
+        tasks.append(asyncio.create_task(_run_component(comp, stop_event)))
+    tasks.append(asyncio.create_task(_heartbeat(stop_event, 30)))
+
+    # wait until stop_event is set
+    await stop_event.wait()
+
+    # cancel all tasks
     for t in tasks:
         t.cancel()
-    with suppress(Exception):
-        await asyncio.gather(*tasks, return_exceptions=True)
-    _log("shutdown complete.")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _l("runner", "shutdown complete.")
+
 
 if __name__ == "__main__":
-    # Optional uvloop for speed if installed
-    with suppress(Exception):
-        import uvloop
-        uvloop.install()
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        _log("KeyboardInterrupt — bye.")
+    asyncio.run(main())
