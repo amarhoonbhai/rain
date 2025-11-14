@@ -1,4 +1,4 @@
-# core/mongo.py — Mongo connection + bootstrap
+# core/mongo.py — Mongo connection + indexes
 import os
 from functools import lru_cache
 from pymongo import MongoClient, ASCENDING
@@ -11,7 +11,8 @@ if not MONGO_URI:
 
 @lru_cache(maxsize=1)
 def _client() -> MongoClient:
-    return MongoClient(MONGO_URI, appname="spinify-rain")
+    # Let the URI carry appName; avoid extra kwargs for widest compatibility
+    return MongoClient(MONGO_URI)
 
 @lru_cache(maxsize=1)
 def db():
