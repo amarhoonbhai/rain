@@ -60,8 +60,10 @@ def ensure_user(user_id: int, username: Optional[str] = None):
     )
 
 def users_count() -> int:
-    # exact count (small collection), prefer over estimated_document_count
     return db().users.count_documents({})
+
+def list_user_ids() -> List[int]:
+    return [doc["user_id"] for doc in db().users.find({}, {"_id": 0, "user_id": 1})]
 
 # ---------------- Sessions ----------------
 def sessions_list(user_id: int) -> List[Dict[str, Any]]:
@@ -167,6 +169,7 @@ def groups_cap(user_id: Optional[int] = None) -> int:
     uid = int(user_id)
     if is_premium(uid):
         return 50
+    # explicit override (used by unlock/premium UI)
     v = get_setting(f"groups_cap:{uid}", None)
     if v is not None:
         vi = _as_int(v, None)
