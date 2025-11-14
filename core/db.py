@@ -1,7 +1,11 @@
 # core/db.py — Mongo-backed DB facade (keeps old function names)
-# Covers: users, sessions, groups (caps/unlock/premium), intervals, stats,
-# settings/KV, gate channels, night mode, name-lock, ads (compat),
-# + a tiny get_conn() shim for broadcast code.
+# Covers:
+#   users, sessions, groups (caps/unlock/premium), intervals, stats,
+#   settings/KV, gate channels, night mode, name-lock, ads (compat),
+#   plus a tiny get_conn() shim for broadcast code.
+#
+# NOTE:
+#   Requires core/mongo.py with MONGO_URI and optional MONGO_DB_NAME.
 
 import os
 from datetime import datetime, timezone
@@ -19,22 +23,25 @@ class _FakeCursor:
         self._rows = rows
 
     def fetchall(self):
+        # emulate sqlite3.Row list with 'user_id'
         return [{"user_id": r} for r in self._rows]
 
 
 class _FakeConn:
     def execute(self, query: str):
         q = (query or "").strip().lower()
+        # main_bot uses: "SELECT user_id FROM users"
         if q.startswith("select user_id from users"):
             ids = [doc["user_id"] for doc in db().users.find({}, {"user_id": 1})]
             return _FakeCursor(ids)
-        raise RuntimeError("get_conn().execute(): unsupported query")
+        raise RuntimeError(f"get_conn().execute(): unsupported query: {query!r}")
 
     def close(self):
         ...
 
 
 def get_conn():
+    """Tiny shim so old broadcast code using sqlite-style API keeps working."""
     return _FakeConn()
 
 # ---------------- Helpers ----------------
@@ -75,12 +82,12 @@ def ensure_user(user_id: int, username: Optional[str] = None):
 
 
 def users_count() -> int:
-    # exact count (small collection)
+    # exact count (collection is small)
     return db().users.count_documents({})
 
 
 def list_user_ids() -> List[int]:
-    """Back-compat helper: list all user_ids."""
+    """Compatibility helper. Used by some old tools/broadcast logic."""
     return [doc["user_id"] for doc in db().users.find({}, {"user_id": 1})]
 
 # ---------------- Sessions ----------------
@@ -94,6 +101,7 @@ def sessions_list(user_id: int) -> List[Dict[str, Any]]:
 
 
 def sessions_strings(user_id: int) -> List[Dict[str, Any]]:
+    # kept same shape for worker usage
     return sessions_list(user_id)
 
 
@@ -102,11 +110,14 @@ def sessions_count_user(user_id: int) -> int:
 
 
 def sessions_delete(user_id: int, slot: int) -> int:
-    res = db().sessions.delete_one({"user_id": int(user_id), "slot": int(slot)})
+    res = db().sessions.delete_one(
+        {"user_id": int(user_id), "slot": int(slot)}
+    )
     return int(res.deleted_count or 0)
 
 
 def _session_slots_cap(user_id: int) -> int:
+    # default 3; overridable via env
     try:
         return max(1, int(os.getenv("SESSION_SLOTS_CAP", "3")))
     except Exception:
@@ -114,10 +125,16 @@ def _session_slots_cap(user_id: int) -> int:
 
 
 def first_free_slot(user_id: int, cap: Optional[int] = None) -> Optional[int]:
+    """
+    1-based slot numbering (1..cap).
+    If all taken, reuse the oldest slot by updated_at (for convenience).
+    """
     cap = cap or _session_slots_cap(user_id)
     used = {
         doc["slot"]
-        for doc in db().sessions.find({"user_id": int(user_id)}, {"slot": 1})
+        for doc in db().sessions.find(
+            {"user_id": int(user_id)}, {"slot": 1}
+        )
     }
     for s in range(1, cap + 1):
         if s not in used:
@@ -157,7 +174,9 @@ delete_session_slot = sessions_delete
 def users_with_sessions() -> List[int]:
     return [
         doc["_id"]
-        for doc in db().sessions.aggregate([{"$group": {"_id": "$user_id"}}])
+        for doc in db().sessions.aggregate(
+            [{"$group": {"_id": "$user_id"}}]
+        )
     ]
 
 
@@ -223,30 +242,39 @@ def set_gc_unlock(user_id: int, enabled: bool):
 
 
 def groups_cap(user_id: Optional[int] = None) -> int:
+    """
+    Default: 5 free
+    Unlock GC: 10
+    Premium: 50
+    Per-user overrides via key: groups_cap:{uid}
+    """
     if user_id is None:
         return 5
     uid = int(user_id)
-    # Premium cap
+
+    # Premium always wins
     if is_premium(uid):
         return 50
+
     # Explicit override
     v = get_setting(f"groups_cap:{uid}", None)
     if v is not None:
         vi = _as_int(v, None)
         if vi is not None:
             return vi
-    # Unlock flag → 10; else default 5
+
+    # Unlock flag → 10, else 5
     return 10 if is_gc_unlocked(uid) else 5
 
 
-def groups_cap_for(user_id: int) -> int:
-    """Back-compat alias used by some main_bot versions."""
-    return groups_cap(user_id)
-
-
-def set_groups_cap_for(user_id: int, cap: int) -> None:
-    """Back-compat: owner menu / unlock GC may call this."""
+def set_groups_cap_for(user_id: int, cap: int):
+    """Alias used by some older code to override per-user group cap."""
     set_setting(f"groups_cap:{int(user_id)}", int(cap))
+
+
+def groups_cap_for(user_id: int) -> int:
+    """Alias wrapper for groups_cap(user_id)."""
+    return groups_cap(user_id)
 
 
 def add_group(user_id: int, target: str) -> int:
@@ -301,6 +329,7 @@ def inc_sent_ok(user_id: int, delta: int = 1):
         {"$inc": {"sent_ok": int(delta)}},
         upsert=True,
     )
+    # also keep global aggregate
     db().settings.update_one(
         {"key": "global:sent_ok"},
         {"$inc": {"val": int(delta)}},
@@ -327,10 +356,11 @@ def top_users(limit: int = 10) -> List[Dict[str, Any]]:
     return rows
 
 
-def last_sent_at_for(user_id: int) -> Optional[int]:  # back-compat alias
+def last_sent_at_for(user_id: int) -> Optional[int]:
+    """Back-compat alias for get_last_sent_at()."""
     return get_last_sent_at(user_id)
 
-# ---------------- Ads (compat) ----------------
+# ---------------- Ads (compat; worker may ignore when using Saved-All) ----------------
 def set_ad(user_id: int, text: str, parse_mode: Optional[str]):
     db().settings.update_one(
         {"key": f"ad:{int(user_id)}"},
@@ -357,6 +387,8 @@ def get_gate_channels_effective() -> tuple[Optional[str], Optional[str]]:
     ch2 = get_setting("gate:ch2", None)
     if ch1 or ch2:
         return ch1, ch2
+
+    # fallback: env REQUIRED_CHANNELS
     env_csv = os.getenv("REQUIRED_CHANNELS", "").strip()
     if env_csv:
         parts = [p.strip() for p in env_csv.split(",") if p.strip()]
@@ -364,6 +396,8 @@ def get_gate_channels_effective() -> tuple[Optional[str], Optional[str]]:
             return parts[0], parts[1]
         if len(parts) == 1:
             return parts[0], None
+
+    # final defaults (your pair)
     return "@PhiloBots", "@TheTrafficZone"
 
 
@@ -378,7 +412,12 @@ def night_enabled() -> bool:
 def set_night_enabled(enabled: bool):
     set_setting("night:enabled", 1 if enabled else 0)
 
-# ---------------- Premium name-lock ----------------
+
+def set_global_night_mode(enabled: bool):
+    """Old alias name used in some code paths."""
+    set_night_enabled(enabled)
+
+# ---------------- Premium name-lock (used by enforcer/owner menu) ----------------
 def set_name_lock(user_id: int, enabled: bool, name: Optional[str] = None):
     set_setting(f"premium:lock:enabled:{int(user_id)}", 1 if enabled else 0)
     if name is not None:
