@@ -5,7 +5,7 @@
 #  • Auto-submit when >=5 digits.
 #  • 2FA support.
 #  • Saves session into a slot (0..2) via core.db (first_free_slot + sessions_upsert_slot).
-#  • After success: instruct user to PIN ad in Saved Messages (worker forwards the pinned one).
+#  • After success: instruct user to keep ads in Saved Messages (Saved-All mode; worker cycles oldest→newest).
 #  • Uses ✇ style hints.
 #
 # ENV:
@@ -178,7 +178,6 @@ async def _render_otp(chat_id: int, message_id: int, d: dict):
             reply_markup=otp_inline_kb(),
         )
     except TelegramBadRequest as e:
-        # ignore "message is not modified"
         if "message is not modified" not in str(e).lower():
             raise
     except Exception:
@@ -296,7 +295,7 @@ WELCOME_TXT = (
     "  2) Send your API_HASH\n"
     "  3) Send your phone number in +countrycode format (e.g., +9198XXXXXXX)\n"
     "  4) Enter the code using the keypad (auto-submit & auto-resend)\n"
-    "  5) After success: open <b>Saved Messages</b>, send your ad & <b>PIN it</b> — worker forwards that."
+    "  5) After success: put your ads (text/media) in <b>Saved Messages</b> — worker will forward them oldest→newest."
 )
 
 @dp.message(Command("start"))
@@ -358,7 +357,6 @@ async def step_phone(msg: Message, state: FSMContext):
     _start_tick(msg.chat.id, status.message_id, state)
     await state.set_state(Login.otp)
 
-    # clear instruction for user
     if (delivery or "").lower().startswith("telegram"):
         await msg.answer(CONFIRM_PROMPT)
     elif (delivery or "").lower().startswith("sms"):
@@ -406,11 +404,12 @@ async def _finalize_success(user_id: int, api_id: int, api_hash: str, session_st
 
     txt = (
         f"✅ Session saved in <b>Slot {slot}</b>.\n\n"
-        "✇ Next steps:\n"
+        "✇ Next steps (Saved-All Mode):\n"
         "  • Open your account’s <b>Saved Messages</b>\n"
-        "  • Send your ad (text or media + caption — premium emoji OK)\n"
-        "  • <b>PIN</b> that message — worker forwards this exact pinned item.\n"
-        "  • Go to @SpinifyAdsBot → add groups (any handle/ID/link), set interval (30/45/60), then ▶ Start."
+        "  • Put all your ads there (text or media + caption; premium emoji OK)\n"
+        "  • Worker will forward <u>oldest → newest</u> every interval\n"
+        "  • In @SpinifyAdsBot use <code>📜 Commands</code> to see:\n"
+        "      <code>.addgc</code> (add targets), <code>.gc</code> (list), <code>.time</code> (30m/45m/60m), <code>.adreset</code> (restart cycle)\n"
     )
     try:
         await bot.send_message(chat_id, txt)
