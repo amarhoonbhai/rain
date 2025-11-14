@@ -2,7 +2,7 @@
 # Mode: Saved-All via user self-commands (.addgc/.gc/.time/.adreset)
 # - Channel gate: requires joining @PhiloBots and @TheTrafficZone (or your custom pair)
 # - Manage Accounts: delete slots; add via @SpinifyLoginBot
-# - Unlock GC: show private/public invite link; on "I've Joined" -> raises groups cap to 10
+# - Unlock GC: supports private/public link; if UNLOCK_GC_CHAT_ID is set we verify membership, else trust-based.
 # - Commands view: how to use self-commands from logged-in account
 # - /fstats (everyone), /stats (owner), /top N, owner Night toggle, Broadcast, Premium (name-lock + 50 GC cap)
 # - Disclaimer
@@ -25,29 +25,28 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from core.db import (
-    init_db, get_conn,
-    ensure_user,
+    # init & users
+    init_db, ensure_user, users_count, list_user_ids,
     # sessions
     sessions_list, sessions_delete, sessions_count_user, sessions_count,
-    # saved groups cap
-    list_groups, groups_cap,
+    # groups (per-user cap)
+    list_groups, groups_cap_for, set_groups_cap_for,
     # schedule
     get_interval, get_last_sent_at,
     # stats
-    users_count, get_total_sent_ok, top_users,
+    get_total_sent_ok, top_users,
     # gate & settings
     get_gate_channels_effective, set_setting, get_setting,
     # night mode
     night_enabled, set_night_enabled,
-    # premium (name lock flag only; enforcement done elsewhere)
-    set_name_lock,
 )
 
 # ---------------- ENV / BOOT ----------------
 load_dotenv()
 TOKEN = (os.getenv("MAIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-UNLOCK_GC_LINK = os.getenv("UNLOCK_GC_LINK", "").strip()  # can be private invite; we trust manual join
+UNLOCK_GC_LINK = os.getenv("UNLOCK_GC_LINK", "").strip()      # optional: show invite button
+UNLOCK_GC_CHAT_ID = os.getenv("UNLOCK_GC_CHAT_ID", "").strip() # optional: verify via chat id
 
 if not TOKEN or ":" not in TOKEN:
     raise RuntimeError("MAIN_BOT_TOKEN missing/malformed.")
@@ -224,8 +223,9 @@ def _commands_text() -> str:
         "✇ <code>.addgc</code> &lt;targets&gt; — add @usernames, numeric IDs, or ANY t.me link (private invites are stored; join manually)\n"
         "✇ <code>.gc</code> — list saved targets (cap 5, or 10 after Unlock)\n"
         "✇ <code>.time</code> 30m|45m|60m — set interval\n"
-        "✇ <code>.adreset</code> — restart the Saved-messages cycle\n\n"
-        "✇ Put your ads (text/media, premium emoji OK) in <b>Saved Messages</b>. The worker cycles through them every interval and copies to all targets with ~10s gap."
+        "✇ <code>.adreset</code> — restart the Saved-Messages cycle\n\n"
+        "<b>Mode: Saved-All</b> → forwards your Saved Messages <i>oldest → newest</i>.\n"
+        "At each tick it forwards the next saved message to <b>all</b> your groups with a <b>~30s gap</b> per group."
     )
 
 async def view_home(msg_or_cq, uid: int):
@@ -238,7 +238,7 @@ async def view_home(msg_or_cq, uid: int):
         "✇ Use @SpinifyLoginBot to add up to 3 accounts.\n"
         "✇ Then send <code>.addgc</code>, <code>.gc</code>, <code>.time</code> etc. from your logged-in account.\n\n"
         f"✇ Sessions: {'✅' if have_sessions else '❌'}\n"
-        f"✇ Groups saved: {groups}/{groups_cap(uid)}\n"
+        f"✇ Groups saved: {groups}/{groups_cap_for(uid)}\n"
         f"✇ Interval: {interval} min\n"
         f"✇ Next send: {next_line}\n"
         f"🌙 Night Mode: {'ON' if night_enabled() else 'OFF'}"
@@ -261,7 +261,7 @@ async def view_accounts(cq: CallbackQuery):
     await safe_edit_text(cq.message, text, reply_markup=kb_accounts(slots))
 
 async def view_unlock(cq: CallbackQuery):
-    cap_now = groups_cap(cq.from_user.id)
+    cap_now = groups_cap_for(cq.from_user.id)
     txt = (
         "🔓 Unlock GC\n"
         "✇ Join the GC below to unlock 10 target slots (from 5).\n"
@@ -349,15 +349,37 @@ async def cb_acct_del(cq: CallbackQuery):
         log.error(f"acct del err: {e}")
     await view_accounts(cq)
 
-# Unlock confirm (trust-based; supports private invites)
+# Unlock confirm:
+# - if UNLOCK_GC_CHAT_ID is set and numeric: verify membership in that chat
+# - else: trust-based unlock to 10
 @dp.callback_query(F.data == "unlock:confirm")
 async def cb_unlock_confirm(cq: CallbackQuery):
     uid = cq.from_user.id
-    # Raise personal cap to 10; groups_cap() should read this
-    set_setting(f"groups_cap:{uid}", 10)
-    await safe_edit_text(cq.message, f"✅ Unlocked. Your group cap is now {groups_cap(uid)}.", reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]]
-    ))
+    chat_id_env = UNLOCK_GC_CHAT_ID.strip()
+    if chat_id_env:
+        try:
+            chat_id = int(chat_id_env)
+            try:
+                m = await bot.get_chat_member(chat_id, uid)
+                status = str(getattr(m, "status", "left")).lower()
+                if status in {"left", "kicked"}:
+                    raise RuntimeError("not a member")
+            except Exception:
+                await safe_edit_text(
+                    cq.message,
+                    "❌ You're not a member yet.\nJoin the GC, then tap <b>I've Joined</b>.",
+                    reply_markup=kb_unlock()
+                )
+                return
+        except Exception:
+            # bad chat id — fall back to trust-based
+            pass
+    set_groups_cap_for(uid, 10)
+    await safe_edit_text(
+        cq.message,
+        f"✅ Unlocked. Your group cap is now {groups_cap_for(uid)}.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]])
+    )
 
 # ---------- /fstats (everyone) ----------
 @dp.message(Command("fstats"))
@@ -450,12 +472,10 @@ async def cb_owner_broadcast(cq: CallbackQuery, state: FSMContext):
 async def on_broadcast_text(msg: Message, state: FSMContext):
     if not is_owner(msg.from_user.id):
         await state.clear(); return
-    text = msg.text
-    await msg.answer("📤 Broadcasting…")
-    conn = get_conn()
-    uids = [r["user_id"] for r in conn.execute("SELECT user_id FROM users").fetchall()]
-    conn.close()
+    text = msg.text or ""
+    uids = list_user_ids()
     ok = bad = 0
+    await msg.answer(f"📤 Broadcasting to {len(uids)} users…")
     for i, uid in enumerate(uids, 1):
         try:
             await bot.send_message(uid, text)
@@ -473,17 +493,23 @@ async def cb_owner_upgrade_menu(cq: CallbackQuery):
     if not is_owner(cq.from_user.id): return
     await safe_edit_text(cq.message, "💎 Premium Controls", reply_markup=kb_owner_upgrade_menu())
 
+class _OwnerPremiumFlow(StatesGroup):
+    # local helper states to avoid mixing with other flows
+    get_user = State()
+    get_name = State()
+    get_user_down = State()
+
 @dp.callback_query(F.data == "owner:upgrade:do")
 async def cb_owner_upgrade_do(cq: CallbackQuery, state: FSMContext):
     if not is_owner(cq.from_user.id): return
-    await state.set_state(OwnerFlow.upgrade_user)
+    await state.set_state(_OwnerPremiumFlow.get_user)
     await safe_edit_text(
         cq.message,
         "✇ Send the <code>user_id</code> to upgrade (next message).\n(Then I'll ask for an optional locked name.)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]])
     )
 
-@dp.message(OwnerFlow.upgrade_user)
+@dp.message(_OwnerPremiumFlow.get_user)
 async def on_upgrade_user(msg: Message, state: FSMContext):
     if not is_owner(msg.from_user.id):
         await state.clear(); return
@@ -492,30 +518,31 @@ async def on_upgrade_user(msg: Message, state: FSMContext):
     except Exception:
         await msg.answer("❌ user_id must be an integer. Try again or /cancel."); return
     await state.update_data(target=target)
-    await state.set_state(OwnerFlow.upgrade_name)
+    await state.set_state(_OwnerPremiumFlow.get_name)
     await msg.answer("✇ Send locked display name (or send '-' to skip):")
 
-@dp.message(OwnerFlow.upgrade_name)
+@dp.message(_OwnerPremiumFlow.get_name)
 async def on_upgrade_name(msg: Message, state: FSMContext):
     if not is_owner(msg.from_user.id):
         await state.clear(); return
     data = await state.get_data()
     target = data.get("target")
     locked = None if msg.text.strip() == "-" else msg.text.strip()
-    set_name_lock(target, True, name=locked)
-    # raise cap to 50 for premium
-    set_setting(f"groups_cap:{target}", 50)
+    # name-lock flags (enforced by enforcer)
+    set_setting(f"name_lock:{target}", 1)
+    if locked: set_setting(f"name_lock:name:{target}", locked)
+    set_groups_cap_for(target, 50)
     await state.clear()
     await msg.answer(f"✅ Premium enabled for <code>{target}</code> (cap=50){' with name “'+locked+'”' if locked else ''}.")
 
 @dp.callback_query(F.data == "owner:downgrade:do")
 async def cb_owner_downgrade_do(cq: CallbackQuery, state: FSMContext):
     if not is_owner(cq.from_user.id): return
-    await state.set_state(OwnerFlow.downgrade_user)
+    await state.set_state(_OwnerPremiumFlow.get_user_down)
     await safe_edit_text(cq.message, "✇ Send the <code>user_id</code> to downgrade (next message).",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]]))
 
-@dp.message(OwnerFlow.downgrade_user)
+@dp.message(_OwnerPremiumFlow.get_user_down)
 async def on_downgrade_user(msg: Message, state: FSMContext):
     if not is_owner(msg.from_user.id):
         await state.clear(); return
@@ -523,9 +550,9 @@ async def on_downgrade_user(msg: Message, state: FSMContext):
         target = int(msg.text.strip())
     except Exception:
         await msg.answer("❌ user_id must be integer"); return
-    set_name_lock(target, False)
-    # reset to default free cap (5)
-    set_setting(f"groups_cap:{target}", 5)
+    set_setting(f"name_lock:{target}", 0)
+    set_setting(f"name_lock:name:{target}", None)
+    set_groups_cap_for(target, 5)
     await state.clear()
     await msg.answer(f"✅ Premium disabled for <code>{target}</code> (cap=5).")
 
