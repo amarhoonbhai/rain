@@ -240,8 +240,13 @@ def groups_cap(user_id: Optional[int] = None) -> int:
 
 
 def groups_cap_for(user_id: int) -> int:
-    """Back-compat alias: some main_bot versions import this."""
+    """Back-compat alias used by some main_bot versions."""
     return groups_cap(user_id)
+
+
+def set_groups_cap_for(user_id: int, cap: int) -> None:
+    """Back-compat: owner menu / unlock GC may call this."""
+    set_setting(f"groups_cap:{int(user_id)}", int(cap))
 
 
 def add_group(user_id: int, target: str) -> int:
