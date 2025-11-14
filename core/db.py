@@ -1,10 +1,9 @@
 # core/db.py — Mongo-backed DB facade (keeps old function names)
-# Covers:
-#   users, sessions, groups (with caps/unlock/premium), intervals, stats,
-#   settings/KV, gate channels, night mode, name-lock, ads (compat),
-#   plus a tiny get_conn() shim for broadcast code.
+# Covers: users, sessions, groups (caps/unlock/premium), intervals, stats,
+# settings/KV, gate channels, night mode, name-lock, ads (compat),
+# + a tiny get_conn() shim for broadcast code.
 
-import os, json
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -61,7 +60,8 @@ def ensure_user(user_id: int, username: Optional[str] = None):
     )
 
 def users_count() -> int:
-    return db().users.estimated_document_count()
+    # exact count (small collection), prefer over estimated_document_count
+    return db().users.count_documents({})
 
 # ---------------- Sessions ----------------
 def sessions_list(user_id: int) -> List[Dict[str, Any]]:
@@ -79,7 +79,6 @@ def sessions_delete(user_id: int, slot: int) -> int:
     return int(res.deleted_count or 0)
 
 def first_free_slot(user_id: int, cap: Optional[int] = None) -> Optional[int]:
-    # 1-based slots (compat with your logs/UI)
     cap = cap or _session_slots_cap(user_id)
     used = {doc["slot"] for doc in db().sessions.find({"user_id": int(user_id)}, {"slot": 1})}
     for s in range(1, cap + 1):
@@ -166,16 +165,13 @@ def groups_cap(user_id: Optional[int] = None) -> int:
     if user_id is None:
         return 5
     uid = int(user_id)
-    # Premium always wins
     if is_premium(uid):
         return 50
-    # Explicit override (used by Unlock GC and premium menu)
     v = get_setting(f"groups_cap:{uid}", None)
     if v is not None:
         vi = _as_int(v, None)
         if vi is not None:
             return vi
-    # Unlock flag → 10; else default 5
     return 10 if is_gc_unlocked(uid) else 5
 
 def add_group(user_id: int, target: str) -> int:
@@ -189,7 +185,7 @@ def add_group(user_id: int, target: str) -> int:
     if len(items) >= groups_cap(user_id):
         return 0
     items.append(target)
-    db().groups.update_one({"user_id": int(user_id)}, {"$set": {"targets": items, "updated_at": _now_epoch()}})
+    db().groups.update_one({"user_id": int(user_id)}, {"$set": {"targets": items, "updated_at": _now_epoch()}}, upsert=True)
     return 1
 
 def clear_groups(user_id: int):
@@ -228,11 +224,10 @@ def top_users(limit: int = 10) -> List[Dict[str, Any]]:
         r["sent_ok"] = _as_int(r.get("sent_ok", 0), 0)
     return rows
 
-# Back-compat alias
-def last_sent_at_for(user_id: int) -> Optional[int]:
+def last_sent_at_for(user_id: int) -> Optional[int]:  # back-compat alias
     return get_last_sent_at(user_id)
 
-# ---------------- Ads (compat; worker may ignore when using Saved-All) ----------------
+# ---------------- Ads (compat) ----------------
 def set_ad(user_id: int, text: str, parse_mode: Optional[str]):
     db().settings.update_one(
         {"key": f"ad:{int(user_id)}"},
@@ -252,13 +247,11 @@ def get_gate_channels_effective() -> tuple[Optional[str], Optional[str]]:
     ch2 = get_setting("gate:ch2", None)
     if ch1 or ch2:
         return ch1, ch2
-    # fallback to env REQUIRED_CHANNELS
     env_csv = os.getenv("REQUIRED_CHANNELS", "").strip()
     if env_csv:
         parts = [p.strip() for p in env_csv.split(",") if p.strip()]
         if len(parts) >= 2: return parts[0], parts[1]
         if len(parts) == 1: return parts[0], None
-    # final defaults (your pair)
     return "@PhiloBots", "@TheTrafficZone"
 
 def night_enabled() -> bool:
@@ -271,7 +264,7 @@ def night_enabled() -> bool:
 def set_night_enabled(enabled: bool):
     set_setting("night:enabled", 1 if enabled else 0)
 
-# ---------------- Premium name-lock (used by enforcer/owner menu) ----------------
+# ---------------- Premium name-lock ----------------
 def set_name_lock(user_id: int, enabled: bool, name: Optional[str] = None):
     set_setting(f"premium:lock:enabled:{int(user_id)}", 1 if enabled else 0)
     if name is not None:
