@@ -1,7 +1,7 @@
 # run_all.py — async supervisor for all Telegram services
-#   - main_bot        (Aiogram main UI)
-#   - login_bot       (account login & session saver)
-#   - worker_forward  (Saved Messages forwarder)
+#   - main_bot         (Aiogram main UI)
+#   - login_bot        (account login & session saver)
+#   - worker_forward   (Saved Messages forwarder - Telethon)
 #   - profile_enforcer (bio/name enforcer)
 #
 # Features:
@@ -19,7 +19,7 @@ import sys
 import asyncio
 import signal
 import logging
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable
 
 # --- Load environment (.env) before reading settings / Mongo URI ---
 try:
@@ -67,13 +67,16 @@ async def heartbeat() -> None:
 
 # ---------- Env validation ----------
 def _has_mongo_env() -> bool:
+    """
+    Basic Mongo presence check for services that actually use Mongo (bots/enforcer).
+    Worker forwarder (Telethon) is file/JSON-based and does NOT need this.
+    """
     uri = (os.getenv("MONGO_URI") or os.getenv("MONGODB_URI") or "").strip()
     dbn = (os.getenv("MONGO_DB_NAME") or "rain").strip()
     if not uri:
         log.error("MONGO_URI missing in environment")
         return False
-    # guard against accidental trailing/leading spaces
-    if dbn.strip() == "" or dbn.strip() == '" "' or dbn == " ":
+    if not dbn or dbn.strip() in {"", '" "', " "}:
         log.error("Bad database name in MONGO_DB_NAME (got %r)", dbn)
         return False
     return True
@@ -97,7 +100,11 @@ def _ok_login_bot() -> bool:
 
 
 def _ok_worker() -> bool:
-    return _has_mongo_env()
+    """
+    Telethon forwarder now uses local JSON + .session files,
+    no Mongo dependency. Always OK from env-perspective.
+    """
+    return True
 
 
 def _ok_enforcer() -> bool:
@@ -116,8 +123,12 @@ async def _run_login_bot() -> None:
 
 
 async def _run_worker() -> None:
+    """
+    Telethon worker_forward entrypoint.
+    """
     import worker_forward
-    await worker_forward.main_loop()
+    # new worker exposes async def main()
+    await worker_forward.main()
 
 
 async def _run_enforcer() -> None:
@@ -167,8 +178,7 @@ async def run_service_loop(
 
 # ---------- Main ----------
 async def main() -> None:
-    # One instance per bot token! If you run multiple copies,
-    # Telegram will throw a conflict error.
+    # You should run only one instance of this script per bot-token set.
     tasks = [
         asyncio.create_task(run_service_loop("login-bot", _ok_login_bot, _run_login_bot)),
         asyncio.create_task(run_service_loop("main-bot",  _ok_main_bot,  _run_main_bot)),
