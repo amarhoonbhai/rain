@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, Unauthorized, RPCError
 from pyrogram.types import Message
+from pyrogram.handlers import MessageHandler
 
-# Ensure .env is loaded even if worker_forward is run standalone
+# Try to load .env (so worker can also run standalone, not only via run_all)
 try:
     from core.mongo import _load_dotenv_best_effort  # type: ignore
 except Exception:
@@ -45,6 +46,7 @@ STATE: Dict[int, Dict[str, Any]] = {}  # {user_id: {"apps":[Client...], "saved_i
 
 
 # ---------- Saved-All helpers ----------
+
 async def fetch_saved_ids(app: Client) -> List[int]:
     """Return Saved Messages ids, oldest → newest."""
     ids: List[int] = []
@@ -69,7 +71,8 @@ def _cur_idx(user_id: int) -> int:
     return int(STATE.get(user_id, {}).get("idx", 0))
 
 
-# ---------- command parsing (from any chat, only for .me sender) ----------
+# ---------- helpers for commands ----------
+
 HELP_TEXT = (
     "📜 Commands\n"
     ".help — this help\n"
@@ -103,7 +106,6 @@ def _split_targets_from_text(body: str) -> List[str]:
         raw = raw.strip()
         if not raw:
             continue
-        # allow space-separated @handles on same line
         for token in raw.split():
             token = token.strip()
             if not token:
@@ -117,17 +119,21 @@ def _fmt_ts(ts: Optional[int]) -> str:
         return "never"
     try:
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        # you can tweak format if you want local time
         return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
     except Exception:
         return str(ts)
 
 
-def register_session_handlers(app: Client, user_id: int) -> None:
-    """Register .help/.status/.addgc/.gc/.cleargc/.time/.adreset on this Client."""
+# ---------- command handler registration ----------
 
-    @app.on_message(filters.me & filters.text)
-    async def my_text(_, msg: Message) -> None:  # type: ignore[override]
+def register_session_handlers(app: Client, user_id: int) -> None:
+    """
+    Register command handlers on this Client.
+
+    Uses explicit add_handler so it works even when called after .start().
+    """
+
+    async def on_command(client: Client, msg: Message) -> None:
         text = (msg.text or "").strip()
         if not text.startswith("."):
             return
@@ -176,17 +182,12 @@ def register_session_handlers(app: Client, user_id: int) -> None:
                 return
 
             if text.startswith(".addgc"):
-                # Accept:
-                #   .addgc @gc1 @gc2
-                #   .addgc\n@gc1\n@gc2
-                #   .addgc  (and reply to a message with list)
                 body_after_cmd = text[len(".addgc"):].strip()
                 lines: List[str] = []
 
                 if body_after_cmd:
                     lines = _split_targets_from_text(body_after_cmd)
                 else:
-                    # Use remaining lines in same message (if multiline)
                     tails = text.splitlines()[1:]
                     if tails:
                         lines = _split_targets_from_text("\n".join(tails))
@@ -240,8 +241,14 @@ def register_session_handlers(app: Client, user_id: int) -> None:
         except Exception as e:
             log.exception("cmd error u%s: %s", user_id, e)
 
+    # For user accounts, filters.outgoing is safest; matches your own sent msgs.
+    cmd_filters = filters.outgoing & filters.text
+    app.add_handler(MessageHandler(on_command, cmd_filters))
+    log.info("[u%s] command handler registered", user_id)
+
 
 # ---------- per-user lifecycle ----------
+
 async def build_clients_for_user(uid: int) -> List[Client]:
     apps: List[Client] = []
     for s in sessions_list(uid):
@@ -251,16 +258,14 @@ async def build_clients_for_user(uid: int) -> List[Client]:
                 api_id=int(s["api_id"]),
                 api_hash=str(s["api_hash"]),
                 session_string=str(s["session_string"]),
+                workdir=f"./sessions_u{uid}",  # avoid collisions between users
             )
             await c.start()
+            log.info("[u%s] started session slot=%s", uid, s["slot"])
             register_session_handlers(c, uid)
             apps.append(c)
-            log.info("[u%s] started session slot=%s", uid, s["slot"])
         except Unauthorized:
-            # ping via setting for main bot to DM later (auto-rehydrate)
-            set_setting(
-                f"rehydrate:{uid}", int(datetime.now(timezone.utc).timestamp())
-            )
+            set_setting(f"rehydrate:{uid}", int(datetime.now(timezone.utc).timestamp()))
             log.warning("[u%s] session unauthorized, flagged for rehydrate", uid)
         except Exception as e:
             log.error("[u%s] start session failed: %s", uid, e)
@@ -355,6 +360,7 @@ async def user_loop(uid: int) -> None:
 
 
 # ---------- main loop ----------
+
 async def main_loop() -> None:
     init_db()
     log.info("worker started")
@@ -371,8 +377,7 @@ async def main_loop() -> None:
                 except Unauthorized:
                     set_setting(
                         f"rehydrate:{uid}",
-                        int(datetime.now(timezone.utc).timestamp(),
-                        ),
+                        int(datetime.now(timezone.utc).timestamp()),
                     )
                     log.warning("[u%s] Unauthorized in user_loop; flagged for rehydrate", uid)
                 except Exception as e:
