@@ -1,5 +1,6 @@
 aiogram==3.22.0
 pyrogram==2.0.106
 tgcrypto==1.2.5
-pymongo==4.8.0
+pymongo[srv]==4.8.0
 python-dotenv==1.0.1
+telethon
