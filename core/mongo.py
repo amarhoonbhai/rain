@@ -1,9 +1,11 @@
 # core/mongo.py — resilient Mongo connection + indexes + .env loader
+
 import os
 from functools import lru_cache
 from urllib.parse import urlparse
 
 from pymongo import MongoClient, ASCENDING
+from pymongo.errors import ConfigurationError
 
 
 # ---------- best-effort .env loading ----------
@@ -21,21 +23,28 @@ def _load_dotenv_best_effort() -> None:
         return
 
     # 1) CWD
-    found = find_dotenv(usecwd=True)
-    if found:
-        load_dotenv(found, override=False)
+    try:
+        found = find_dotenv(usecwd=True)
+        if found:
+            load_dotenv(found, override=False)
+    except Exception:
+        pass
 
     # 2) repo root (two parents up from this file)
-    here = os.path.abspath(__file__)
-    repo = os.path.dirname(os.path.dirname(here))
-    env_repo = os.path.join(repo, ".env")
-    if os.path.isfile(env_repo):
-        load_dotenv(env_repo, override=False)
+    try:
+        here = os.path.abspath(__file__)
+        repo = os.path.dirname(os.path.dirname(here))
+        env_repo = os.path.join(repo, ".env")
+        if os.path.isfile(env_repo):
+            load_dotenv(env_repo, override=False)
 
-    # 3) optional .env.local
-    env_local = os.path.join(repo, ".env.local")
-    if os.path.isfile(env_local):
-        load_dotenv(env_local, override=False)
+        # 3) optional .env.local
+        env_local = os.path.join(repo, ".env.local")
+        if os.path.isfile(env_local):
+            load_dotenv(env_local, override=False)
+    except Exception:
+        # even if repo detection fails, we don't want to kill the process
+        pass
 
 
 _load_dotenv_best_effort()
@@ -43,6 +52,11 @@ _load_dotenv_best_effort()
 
 # ---------- helpers ----------
 def _clean(s: str | None) -> str | None:
+    """
+    Normalize env strings:
+      - strip spaces
+      - convert '""' / "''" / empty to None
+    """
     if s is None:
         return None
     s = s.strip()
@@ -51,7 +65,7 @@ def _clean(s: str | None) -> str | None:
     return s
 
 
-def _die_missing_uri(db_name: str | None):
+def _die_missing_uri(db_name: str | None) -> None:
     cwd = os.getcwd()
     msg = (
         "MONGO_URI missing in environment.\n"
@@ -92,8 +106,34 @@ except Exception:
 # ---------- client / db ----------
 @lru_cache(maxsize=1)
 def _client() -> MongoClient:
-    # Let the SRV URI carry appName etc. Avoid extra kwargs for compatibility.
-    return MongoClient(MONGO_URI)
+    """
+    Return a global MongoClient.
+
+    We wrap MongoClient to:
+      - surface ConfigurationError with clearer hints,
+      - especially for mongodb+srv URIs (requires DNS & dnspython).
+    """
+    try:
+        return MongoClient(MONGO_URI)
+    except ConfigurationError as e:
+        # Common causes:
+        #  - dnspython missing for mongodb+srv
+        #  - invalid cluster host name
+        #  - network / DNS issues
+        extra = ""
+        if MONGO_URI.startswith("mongodb+srv://"):
+            extra = (
+                "\n\nHints for mongodb+srv://\n"
+                "- Ensure 'dnspython' is installed (pip install 'pymongo[srv]')\n"
+                "- Check that your cluster host is valid (e.g. *.mongodb.net)\n"
+                "- Make sure there are no hidden spaces or bad characters in MONGO_URI\n"
+            )
+        raise RuntimeError(
+            f"Mongo configuration error: {e}{extra}\n"
+            f"Current MONGO_DB_NAME={MONGO_DB_NAME!r}"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"Mongo connection error: {e}") from e
 
 
 @lru_cache(maxsize=1)
@@ -106,12 +146,36 @@ def db():
 
 
 def ensure_indexes() -> None:
+    """
+    Create required indexes if they do not exist.
+    Safe to call many times.
+    """
     d = db()
-    d.users.create_index([("user_id", ASCENDING)], unique=True, name="u_user_id")
-    d.sessions.create_index([("user_id", ASCENDING), ("slot", ASCENDING)], unique=True, name="u_user_slot")
-    d.groups.create_index([("user_id", ASCENDING)], unique=True, name="u_groups_uid")
-    d.settings.create_index([("key", ASCENDING)], unique=True, name="u_settings_key")
-    d.stats.create_index([("user_id", ASCENDING)], unique=True, name="u_stats_uid")
+    d.users.create_index(
+        [("user_id", ASCENDING)],
+        unique=True,
+        name="u_user_id",
+    )
+    d.sessions.create_index(
+        [("user_id", ASCENDING), ("slot", ASCENDING)],
+        unique=True,
+        name="u_user_slot",
+    )
+    d.groups.create_index(
+        [("user_id", ASCENDING)],
+        unique=True,
+        name="u_groups_uid",
+    )
+    d.settings.create_index(
+        [("key", ASCENDING)],
+        unique=True,
+        name="u_settings_key",
+    )
+    d.stats.create_index(
+        [("user_id", ASCENDING)],
+        unique=True,
+        name="u_stats_uid",
+    )
 
 
 # ---------- optional: small debug helper ----------
