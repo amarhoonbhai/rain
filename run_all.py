@@ -187,4 +187,21 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:
+            # Windows / limited event loop fallback
+            signal.signal(sig, lambda *_: _stop())
+
+    await stop_ev.wait()
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    log.info("shutdown complete.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # extra safety for Ctrl+C in some environments
+        pass
