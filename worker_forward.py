@@ -46,7 +46,6 @@ STATE: Dict[int, Dict[str, Any]] = {}  # {user_id: {"apps":[Client...], "saved_i
 
 
 # ---------- Saved-All helpers ----------
-
 async def fetch_saved_ids(app: Client) -> List[int]:
     """Return Saved Messages ids, oldest → newest."""
     ids: List[int] = []
@@ -71,17 +70,18 @@ def _cur_idx(user_id: int) -> int:
     return int(STATE.get(user_id, {}).get("idx", 0))
 
 
-# ---------- helpers for commands ----------
-
+# ---------- command parsing (from any chat, only for .me sender) ----------
 HELP_TEXT = (
     "📜 Commands\n"
-    ".help — this help\n"
-    ".status — show current worker status\n"
-    ".addgc <one-or-many> — add targets (@handle, id, or any t.me link). "
-    "You can also send a list in the next lines or reply to a message.\n"
-    ".gc — list saved targets | .cleargc — clear all\n"
-    ".time 30m|45m|60m|120 — set interval (minutes). Send just .time to see current.\n"
-    ".adreset — restart Saved-All cycle from first message"
+    "<code>.help</code> — this help\n"
+    "<code>.status</code> — show current worker status\n"
+    "<code>.addgc</code> — add targets (@handle, id, or any t.me link).\n"
+    "   Usage: .addgc @gc1 @gc2  OR\n"
+    "          .addgc\\n@gc1\\n@gc2  OR\n"
+    "          .addgc  (reply to a msg with list)\n"
+    "<code>.gc</code> — list saved targets | <code>.cleargc</code> — clear all\n"
+    "<code>.time</code> 30m|45m|60m|120 — set interval minutes\n"
+    "<code>.adreset</code> — restart Saved-All cycle"
 )
 
 
@@ -124,8 +124,6 @@ def _fmt_ts(ts: Optional[int]) -> str:
         return str(ts)
 
 
-# ---------- command handler registration ----------
-
 def register_session_handlers(app: Client, user_id: int) -> None:
     """
     Register command handlers on this Client.
@@ -134,18 +132,18 @@ def register_session_handlers(app: Client, user_id: int) -> None:
     """
 
     async def on_command(client: Client, msg: Message) -> None:
-        text = (msg.text or "").strip()
-        if not text.startswith("."):
+        t = (msg.text or "").strip()
+        if not t.startswith("."):
             return
 
-        log.info("[cmd] u%s chat=%s text=%r", user_id, msg.chat.id, text)
+        log.info("[cmd] u%s chat=%s text=%r", user_id, msg.chat.id, t)
 
         try:
-            if text.startswith(".help"):
+            if t.startswith(".help"):
                 await msg.reply_text(HELP_TEXT)
                 return
 
-            if text.startswith(".status"):
+            if t.startswith(".status"):
                 targets = list_groups(user_id)
                 cap = groups_cap(user_id)
                 interval = get_interval(user_id)
@@ -165,7 +163,7 @@ def register_session_handlers(app: Client, user_id: int) -> None:
                 await msg.reply_text("\n".join(status_lines))
                 return
 
-            if text.startswith(".gc"):
+            if t.startswith(".gc"):
                 targets = list_groups(user_id)
                 cap = groups_cap(user_id)
                 if not targets:
@@ -176,19 +174,21 @@ def register_session_handlers(app: Client, user_id: int) -> None:
                 await msg.reply_text(f"GC ({len(targets)}/{cap})\n{out}{more}")
                 return
 
-            if text.startswith(".cleargc"):
+            if t.startswith(".cleargc"):
                 clear_groups(user_id)
                 await msg.reply_text("✅ Cleared groups.")
                 return
 
-            if text.startswith(".addgc"):
-                body_after_cmd = text[len(".addgc"):].strip()
+            if t.startswith(".addgc"):
+                body_after_cmd = t[len(".addgc"):].strip()
                 lines: List[str] = []
 
                 if body_after_cmd:
+                    # e.g. ".addgc @gc1 @gc2"
                     lines = _split_targets_from_text(body_after_cmd)
                 else:
-                    tails = text.splitlines()[1:]
+                    # multi-line in the same message
+                    tails = t.splitlines()[1:]
                     if tails:
                         lines = _split_targets_from_text("\n".join(tails))
 
@@ -213,12 +213,12 @@ def register_session_handlers(app: Client, user_id: int) -> None:
                         break
 
                 await msg.reply_text(
-                    f"✅ Added {added}. Now {len(list_groups(user_id))}/{cap} targets."
+                    f"✅ Added {added}. Now {len(list_groups(user_id))}/{cap}."
                 )
                 return
 
-            if text.startswith(".time"):
-                parts = text.split(maxsplit=1)
+            if t.startswith(".time"):
+                parts = t.split(maxsplit=1)
                 if len(parts) == 1:
                     cur = get_interval(user_id)
                     await msg.reply_text(f"⏱ Current interval: {cur} minute(s).")
@@ -232,7 +232,7 @@ def register_session_handlers(app: Client, user_id: int) -> None:
                 await msg.reply_text(f"✅ Interval set to {mins}m.")
                 return
 
-            if text.startswith(".adreset"):
+            if t.startswith(".adreset"):
                 st = STATE.setdefault(user_id, {})
                 st["idx"] = 0
                 await msg.reply_text("✅ Saved-All cycle reset to first message.")
@@ -248,7 +248,6 @@ def register_session_handlers(app: Client, user_id: int) -> None:
 
 
 # ---------- per-user lifecycle ----------
-
 async def build_clients_for_user(uid: int) -> List[Client]:
     apps: List[Client] = []
     for s in sessions_list(uid):
@@ -258,7 +257,7 @@ async def build_clients_for_user(uid: int) -> List[Client]:
                 api_id=int(s["api_id"]),
                 api_hash=str(s["api_hash"]),
                 session_string=str(s["session_string"]),
-                workdir=f"./sessions_u{uid}",  # avoid collisions between users
+                workdir=f"./sessions_u{uid}",
             )
             await c.start()
             log.info("[u%s] started session slot=%s", uid, s["slot"])
@@ -360,7 +359,6 @@ async def user_loop(uid: int) -> None:
 
 
 # ---------- main loop ----------
-
 async def main_loop() -> None:
     init_db()
     log.info("worker started")
