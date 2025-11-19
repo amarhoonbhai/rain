@@ -5,29 +5,30 @@
 #   - groups list from core.db (per panel user)
 #   - interval from core.db (per panel user)
 #
-# Commands (send from your logged-in account = same account whose session you added via login bot):
+# Commands (send from your logged-in Telegram account):
 #   .help
 #   .gc / .groups
 #   .cleargc
-#   .addgc   (also .addgroup)
-#   .delgc   (also .delgroup)
-#   .time 30|45|60          (free)
-#   .time <any>[m|h]        (premium)
-#   .delay <sec>            (premium)
+#   .addgc / .addgroup
+#   .delgc / .delgroup
+#   .time 30|45|60      (free)
+#   .time <any>[m|h]    (premium)
+#   .delay <sec>        (premium)
 #   .status
 #   .adreset
-#   .night ...              (premium)
+#   .night ...          (premium)
 #   .upgrade
 #
 # Free:
 #   - Only .time 30 / 45 / 60
-# Premium (determined by groups_cap(uid) > 10, i.e. 50-cap users):
+# Premium (groups_cap > 10 or OWNER_ID):
 #   - Custom interval (.time 10 / 90 / 2h / 120m ...)
 #   - Custom delay (.delay)
 #   - Auto-Night (.night)
 
 
 import os
+import json
 import asyncio
 import logging
 import re
@@ -69,6 +70,7 @@ TICK_INTERVAL = int(os.getenv("TICK_INTERVAL", "15"))
 
 UPGRADE_CONTACT = os.getenv("UPGRADE_CONTACT", "@SpinifyAdsBot")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
 
 # --------------------------------------------------------------------
 # Auto-Night (global window, premium can change via .night)
@@ -152,7 +154,7 @@ def _seconds_until_quiet_end(cfg: dict) -> int:
         if now.time() < end_t:
             end_dt = datetime.combine(today, end_t, tzinfo=now.tzinfo)
         else:
-            end_dt = datetime.combine(today + timedelta(days=1), end_t, tzinfo=now.tzinfo)
+            end_dt = datetime.combine(today + timedelta(days=1), end_dt, tzinfo=now.tzinfo)
 
     seconds = int((end_dt - now).total_seconds())
     return max(1, seconds)
@@ -229,6 +231,7 @@ def autonight_parse_command(arg: str, cfg: dict) -> tuple[str, dict]:
 
 AUTONIGHT_CFG = _load_autonight()
 
+
 # --------------------------------------------------------------------
 # Forwarder core (Pyrogram + Mongo sessions)
 # --------------------------------------------------------------------
@@ -237,17 +240,17 @@ HELP_TEXT = (
     "🛠 <b>Spinify Worker Commands</b>\n"
     "\n"
     "<b>Groups</b>\n"
-    "• <code>.gc</code> or <code>.groups</code> — list groups\n"
+    "• <code>.gc</code> / <code>.groups</code> — list groups\n"
     "• <code>.cleargc</code> — clear all groups\n"
-    "• <code>.addgc</code> (or <code>.addgroup</code>) + paste @links / t.me links\n"
-    "  → Works in the same message or by replying to a list.\n"
+    "• <code>.addgc</code> / <code>.addgroup</code> — add @usernames / t.me links\n"
+    "• <code>.delgc</code> / <code>.delgroup</code> — remove group\n"
     "\n"
     "<b>Timing</b>\n"
     "• Free: <code>.time 30</code> / <code>.time 45</code> / <code>.time 60</code>\n"
     "• Premium: <code>.time 10</code>, <code>.time 90</code>, <code>.time 2h</code>, <code>.time 120m</code>\n"
     "• Premium: <code>.delay 5</code> (seconds between groups)\n"
     "• <code>.status</code> — show plan, interval, delay, Auto-Night\n"
-    "• <code>.adreset</code> — restart Saved Messages cycle (back to first)\n"
+    "• <code>.adreset</code> — restart Saved Messages cycle\n"
     "\n"
     "<b>Night Mode (Premium)</b>\n"
     "• <code>.night</code> — show current window\n"
@@ -258,16 +261,10 @@ HELP_TEXT = (
     "• <code>.upgrade</code> — get your user ID + contact for premium."
 )
 
-# Per-panel-user state: clients, saved message ids, current index, delay
 STATE: Dict[int, Dict[str, Any]] = {}
 
 
 def _panel_is_premium(uid: int) -> bool:
-    """
-    Treat users with groups_cap > 10 as premium
-    (normal = 5, unlocked = 10, premium menu sets 50).
-    Owner is always premium.
-    """
     if OWNER_ID and uid == OWNER_ID:
         return True
     try:
@@ -321,7 +318,6 @@ def register_session_handlers(app: Client, uid: int) -> None:
             return
 
         premium = _panel_is_premium(uid)
-        delay_sec = _get_delay(uid)
 
         try:
             # .help
@@ -374,7 +370,7 @@ def register_session_handlers(app: Client, uid: int) -> None:
                 if not lines:
                     await msg.reply_text(
                         "⚠️ No targets found.\n"
-                        "Usage examples:\n"
+                        "Usage:\n"
                         "  <code>.addgc @group1</code>\n"
                         "  <code>.addgc</code> then paste one per line\n"
                         "  Or reply to a message containing @links / t.me links."
@@ -402,7 +398,6 @@ def register_session_handlers(app: Client, uid: int) -> None:
                 targets = list_groups(uid)
                 if target in targets:
                     targets.remove(target)
-                    # re-save list by clearing then re-adding
                     clear_groups(uid)
                     for x in targets:
                         add_group(uid, x)
@@ -578,19 +573,32 @@ async def refresh_saved(uid: int) -> None:
     try:
         saved = await fetch_saved_ids(app)
         st["saved_ids"] = saved
+        log.info("[u%s] loaded %s saved messages", uid, len(saved))
     except Exception as e:
         log.error("[u%s] fetch_saved_ids error: %s", uid, e)
 
 
-async def send_copy(app: Client, from_chat, msg_id: int, to_target: str) -> bool:
+async def send_copy(app: Client, msg_id: int, to_target: str) -> bool:
+    """
+    Copy a Saved Message by fetching it again (robust) and using msg.copy().
+    """
     try:
-        await app.copy_message(chat_id=to_target, from_chat_id=from_chat, message_id=msg_id)
+        msg = await app.get_messages("me", msg_id)
+        if not msg:
+            log.warning("no message with id=%s in 'me'", msg_id)
+            return False
+        if not (msg.text or msg.caption or msg.media):
+            log.warning("message id=%s has no forwardable content", msg_id)
+            return False
+
+        await msg.copy(chat_id=to_target)
         return True
+
     except FloodWait as fw:
         await asyncio.sleep(fw.value)
         return False
     except Exception as e:
-        log.warning("copy fail → %s", e)
+        log.warning("copy fail to %s → %s", to_target, e)
         return False
 
 
@@ -601,6 +609,7 @@ async def run_cycle(uid: int) -> None:
     apps = st["apps"]
     targets = list_groups(uid)
     if not targets:
+        log.info("[u%s] no groups configured, skipping cycle", uid)
         return
     if not st["saved_ids"]:
         await refresh_saved(uid)
@@ -613,13 +622,16 @@ async def run_cycle(uid: int) -> None:
     app = apps[0]
     delay_sec = _get_delay(uid)
 
+    log.info("[u%s] running cycle: msg_id=%s to %s groups", uid, msg_id, len(targets))
+
     ok_any = False
     for tg in targets:
         try:
-            good = await asyncio.wait_for(send_copy(app, "me", msg_id, tg), timeout=SEND_TIMEOUT)
-            if good:
+            ok = await asyncio.wait_for(send_copy(app, msg_id, tg), timeout=SEND_TIMEOUT)
+            if ok:
                 ok_any = True
                 inc_sent_ok(uid, 1)
+                log.info("[u%s] forwarded msg_id=%s to %s", uid, msg_id, tg)
         except asyncio.TimeoutError:
             log.warning("[u%s] send timeout to %s", uid, tg)
         await asyncio.sleep(delay_sec)
@@ -627,6 +639,8 @@ async def run_cycle(uid: int) -> None:
     if ok_any:
         mark_sent_now(uid)
         _next_idx(uid, len(st["saved_ids"]))
+    else:
+        log.info("[u%s] cycle finished but nothing delivered (all failed)", uid)
 
 
 async def user_loop(uid: int) -> None:
@@ -634,12 +648,20 @@ async def user_loop(uid: int) -> None:
     interval = get_interval(uid)
     last = get_last_sent_at(uid)
     now = int(datetime.now(timezone.utc).timestamp())
-    if last is None or (now - last) >= interval * 60:
-        # global Auto-Night check before sending
-        if autonight_is_quiet(AUTONIGHT_CFG):
-            log.info("[u%s] Auto-Night quiet window active, skipping cycle.", uid)
-            return
-        await run_cycle(uid)
+
+    if last is None:
+        due = True
+    else:
+        due = (now - last) >= interval * 60
+
+    if not due:
+        return
+
+    if autonight_is_quiet(AUTONIGHT_CFG):
+        log.info("[u%s] Auto-Night quiet window active, skipping cycle.", uid)
+        return
+
+    await run_cycle(uid)
 
 
 async def main_loop() -> None:
@@ -663,13 +685,10 @@ async def main_loop() -> None:
 
 
 async def main() -> None:
-    # ensure Auto-Night config file exists
     if not os.path.exists(AUTONIGHT_PATH):
         _save_autonight(AUTONIGHT_CFG)
     await main_loop()
 
 
 if __name__ == "__main__":
-    import json  # needed for Auto-Night load/save
-
     asyncio.run(main())
