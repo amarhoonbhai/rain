@@ -30,9 +30,12 @@ log = logging.getLogger("worker")
 
 PARALLEL_USERS = int(os.getenv("PARALLEL_USERS", "3"))
 PER_GROUP_DELAY = float(os.getenv("PER_GROUP_DELAY", "30"))   # seconds
-SEND_TIMEOUT = int(os.getenv("SEND_TIMEOUT", "60"))            # seconds (used as soft limit)
+SEND_TIMEOUT = int(os.getenv("SEND_TIMEOUT", "60"))            # seconds
 TICK_INTERVAL = int(os.getenv("TICK_INTERVAL", "15"))          # seconds
 DEFAULT_INTERVAL_MIN = int(os.getenv("DEFAULT_INTERVAL_MIN", "30"))
+
+# Shown to user when they need premium
+PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "@spinify")
 
 # Per-user runtime state
 # STATE[uid] = {
@@ -74,14 +77,28 @@ def _next_idx(uid: int, n: int) -> int:
 
 
 def _format_eta(uid: int) -> str:
-    last = get_last_sent_at(uid)
+    """
+    Human ETA for next send.
+
+    Behaviour:
+      - If never sent: show full interval (e.g., 'in ~30m (first cycle)')
+      - If overdue / very close: show 'very soon'
+      - Otherwise: 'in ~Xm Ys'
+    """
     interval = get_interval(uid) or DEFAULT_INTERVAL_MIN
+    last = get_last_sent_at(uid)
+
+    # Never sent yet
     if last is None:
-        return "now"
+        return f"in ~{interval}m (first cycle)"
+
     now = _now_ts()
     left = interval * 60 - (now - int(last))
-    if left <= 0:
-        return "now"
+
+    # Already due or within a few seconds → show "very soon"
+    if left <= 5:
+        return "very soon"
+
     h, rem = divmod(left, 3600)
     m, s = divmod(rem, 60)
     parts = []
@@ -91,6 +108,7 @@ def _format_eta(uid: int) -> str:
         parts.append(f"{m}m")
     if s and not parts:
         parts.append(f"{s}s")
+
     return "in ~" + " ".join(parts)
 
 
@@ -102,6 +120,9 @@ def _panel_is_premium(uid: int) -> bool:
 
 
 async def fetch_saved_ids(client: TelegramClient) -> List[int]:
+    """
+    Get IDs of Saved Messages (oldest → newest), only those with text or media.
+    """
     ids: List[int] = []
     async for m in client.iter_messages("me", limit=1000):
         if m.message or m.media:
@@ -126,19 +147,20 @@ def register_session_handlers(client: TelegramClient, uid: int) -> None:
         # .help
         if text.startswith(".help"):
             await event.reply(
-                "📜 Commands (send from this account)\n"
-                "• <code>.help</code> — this help\n"
+                "📜 <b>Self Commands</b>\n"
+                "• <code>.help</code> — show this help\n"
                 "• <code>.gc</code> / <code>.groups</code> — list targets\n"
                 "• <code>.addgc</code> — add targets (@/t.me/ID)\n"
                 "• <code>.cleargc</code> — clear all targets\n"
-                "• <code>.delgc &lt;target&gt;</code> — remove one\n"
+                "• <code>.delgc &lt;target&gt;</code> — remove one target\n"
                 "• <code>.time</code> — set interval\n"
                 "• <code>.adreset</code> — restart Saved cycle\n"
                 "• <code>.status</code> — show plan + ETA\n\n"
                 "🧷 <b>.addgc</b> usage:\n"
                 "  1) <code>.addgc @group1 @group2</code>\n"
                 "  2) <code>.addgc</code> then paste one per line\n"
-                "  3) Reply to a message that has @/t.me links and send <code>.addgc</code>."
+                "  3) Reply to a message that has @/t.me links and send <code>.addgc</code>.\n\n"
+                f"💎 Premium upgrade: contact {PREMIUM_CONTACT}"
             )
             return
 
@@ -147,18 +169,18 @@ def register_session_handlers(client: TelegramClient, uid: int) -> None:
             targets = list_groups(uid)
             cap = groups_cap(uid)
             if not targets:
-                await event.reply(f"GC list empty (cap {cap}).")
+                await event.reply(f"🎯 Target list is empty (0/{cap}).\nUse <code>.addgc</code> to add groups.")
                 return
-            head = f"GC ({len(targets)}/{cap})"
-            body = "\n".join(f"• {x}" for x in targets[:100])
-            more = "" if len(targets) <= 100 else f"\n… +{len(targets)-100} more"
-            await event.reply(f"{head}\n{body}{more}")
+
+            lines = [f"{i+1:02d}. {g}" for i, g in enumerate(targets)]
+            head = f"🎯 Targets ({len(targets)}/{cap})"
+            await event.reply(f"{head}\n" + "\n".join(lines))
             return
 
         # .cleargc
         if text.startswith(".cleargc"):
             clear_groups(uid)
-            await event.reply("✅ Cleared all groups.")
+            await event.reply("✅ Cleared all group targets (0/{cap}).".format(cap=groups_cap(uid)))
             return
 
         # .addgc
@@ -166,7 +188,7 @@ def register_session_handlers(client: TelegramClient, uid: int) -> None:
             lines: List[str] = []
 
             # 1) same-line args
-            parts = text.split(maxlength := 1)
+            parts = text.split(maxsplit=1)
             if len(parts) > 1:
                 for token in parts[1].split():
                     token = token.strip()
@@ -206,7 +228,13 @@ def register_session_handlers(client: TelegramClient, uid: int) -> None:
                 if len(list_groups(uid)) >= cap:
                     break
 
-            await event.reply(f"✅ Added {added}. Now {len(list_groups(uid))}/{cap}.")
+            now_count = len(list_groups(uid))
+            await event.reply(
+                "✅ Added <b>{added}</b> target(s).\n"
+                "🎯 Now linked: <b>{now}/{cap}</b> groups.".format(
+                    added=added, now=now_count, cap=cap
+                )
+            )
             return
 
         # .delgc
@@ -222,7 +250,7 @@ def register_session_handlers(client: TelegramClient, uid: int) -> None:
                 clear_groups(uid)
                 for x in targets:
                     add_group(uid, x)
-                await event.reply("✅ Group removed.")
+                await event.reply("✅ Group <code>{}</code> removed.".format(target))
             else:
                 await event.reply("❗ That target is not in your group list.")
             return
@@ -234,7 +262,8 @@ def register_session_handlers(client: TelegramClient, uid: int) -> None:
                 await event.reply(
                     "⏱ Usage:\n"
                     "  Free: <code>.time 30</code>, <code>.time 45</code>, <code>.time 60</code>\n"
-                    "  Premium: any minutes, e.g. <code>.time 10</code>, <code>.time 90</code>"
+                    "  Premium: any minutes, e.g. <code>.time 10</code>, <code>.time 90</code>\n\n"
+                    f"💎 Upgrade contact: {PREMIUM_CONTACT}"
                 )
                 return
             try:
@@ -249,16 +278,17 @@ def register_session_handlers(client: TelegramClient, uid: int) -> None:
 
             if not premium and val not in (30, 45, 60):
                 await event.reply(
-                    "💎 Custom interval is premium-only.\n"
+                    "💎 Custom interval is <b>premium-only</b>.\n"
                     "Free can only use 30, 45 or 60 minutes.\n"
-                    "Try: <code>.time 30</code>, <code>.time 45</code>, <code>.time 60</code>"
+                    "Try: <code>.time 30</code>, <code>.time 45</code>, <code>.time 60</code>\n\n"
+                    f"For upgrade, contact {PREMIUM_CONTACT}."
                 )
                 return
 
             set_interval(uid, val)
             await event.reply(
                 f"✅ Interval set to <b>{val} minutes</b> "
-                f"({'Premium' if premium else 'Free'})."
+                f"({'Premium' if premium else 'Free'} plan)."
             )
             return
 
@@ -277,11 +307,12 @@ def register_session_handlers(client: TelegramClient, uid: int) -> None:
             eta = "—" if gs == 0 else _format_eta(uid)
             plan = "Premium 💎" if premium else "Free ⚪"
             await event.reply(
-                "📊 Status\n"
+                "📊 <b>Status</b>\n"
                 f"• Plan: {plan}\n"
-                f"• Groups: {gs}/{cap}\n"
-                f"• Interval: {interval} min\n"
-                f"• Next send: {eta}"
+                f"• Groups: <b>{gs}/{cap}</b>\n"
+                f"• Interval: <b>{interval} min</b>\n"
+                f"• Next send: {eta}\n\n"
+                f"💎 Upgrade: contact {PREMIUM_CONTACT}"
             )
             return
 
@@ -315,8 +346,14 @@ async def build_client_for_user(uid: int) -> TelegramClient | None:
 
 async def ensure_state(uid: int):
     st = _get_state(uid)
-    if st.get("client") and await st["client"].is_connected():
-        return
+    client = st.get("client")
+    if client is not None:
+        try:
+            if await client.is_connected():
+                return
+        except Exception:
+            pass
+
     # build new client
     try:
         client = await build_client_for_user(uid)
@@ -343,6 +380,12 @@ async def refresh_saved(uid: int):
 
 
 async def run_cycle(uid: int):
+    """
+    Simple logic:
+      - Take next Saved Message (by index)
+      - Forward to all groups
+      - Move index forward
+    """
     st = _get_state(uid)
     client: TelegramClient = st.get("client")
     if not client:
@@ -440,7 +483,7 @@ async def main():
             client = st.get("client")
             if client:
                 try:
-                    asyncio.create_task(client.disconnect())
+                    await client.disconnect()
                 except Exception:
                     pass
 
