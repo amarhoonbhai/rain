@@ -1,12 +1,11 @@
 # run_all.py — async supervisor for all Telegram services
-#   - main_bot         (Aiogram main UI)
-#   - login_bot        (Aiogram + Telethon login & session saver)
-#   - worker_forward   (Telethon Saved Messages forwarder)
-#   - profile_enforcer (Telethon bio/name enforcer)
+#   - main_bot        (Aiogram main UI)
+#   - login_bot       (account login & session saver)
+#   - worker_forward  (Saved Messages forwarder - Telethon)
+#   - profile_enforcer (bio/name enforcer)
 #
 # Features:
-#   • Shared .env loading via core.mongo._load_dotenv_best_effort()
-#   • Per-service env validation (Mongo + bot tokens)
+#   • Per-service env validation (tokens + Mongo)
 #   • Safe import inside the service task (one bad import won’t kill others)
 #   • Auto-restart with simple exponential backoff
 #   • Periodic heartbeat
@@ -26,15 +25,14 @@ from typing import Callable, Awaitable
 try:
     # Preferred: shared loader from core.mongo (handles repo root + .env.local)
     from core.mongo import _load_dotenv_best_effort  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:  # optional dependency / import path
     _load_dotenv_best_effort = None  # type: ignore
 
 if _load_dotenv_best_effort:
     try:
         _load_dotenv_best_effort()
     except Exception:
-        # Don't crash supervisor if .env loading fails;
-        # services will log detailed errors themselves.
+        # Don't crash supervisor if .env loading fails; services will log details.
         pass
 else:
     # Fallback: plain python-dotenv from current working dir
@@ -42,7 +40,6 @@ else:
         from dotenv import load_dotenv  # type: ignore
     except Exception:
         load_dotenv = None  # type: ignore
-
     if load_dotenv:
         try:
             load_dotenv()
@@ -75,7 +72,7 @@ def _has_mongo_env() -> bool:
     if not uri:
         log.error("MONGO_URI missing in environment")
         return False
-    if not dbn or dbn in ('""', "''", " "):
+    if dbn.strip() == "" or dbn.strip() == '" "' or dbn == " ":
         log.error("Bad database name in MONGO_DB_NAME (got %r)", dbn)
         return False
     return True
@@ -83,7 +80,7 @@ def _has_mongo_env() -> bool:
 
 def _has_token(env_key: str) -> bool:
     val = (os.getenv(env_key) or "").strip()
-    # Aiogram-style tokens normally contain a colon
+    # basic sanity: aiogram-style tokens usually contain a colon
     if not val or ":" not in val:
         log.error("%s missing or malformed", env_key)
         return False
@@ -99,12 +96,12 @@ def _ok_login_bot() -> bool:
 
 
 def _ok_worker() -> bool:
-    # Telethon worker uses Mongo sessions + settings, no bot token
+    # worker_forward uses Mongo + Telethon sessions
     return _has_mongo_env()
 
 
 def _ok_enforcer() -> bool:
-    # Telethon profile_enforcer also uses Mongo + user sessions
+    # profile_enforcer uses Mongo + Pyrogram
     return _has_mongo_env()
 
 
@@ -120,13 +117,17 @@ async def _run_login_bot() -> None:
 
 
 async def _run_worker() -> None:
-    # Telethon-based Saved Messages forwarder
+    """
+    Telethon forwarder worker entrypoint.
+
+    Old version used worker_forward.main_loop(), now we call main()
+    which internally runs the loader + per-user clients.
+    """
     import worker_forward
-    await worker_forward.main_loop()
+    await worker_forward.main()
 
 
 async def _run_enforcer() -> None:
-    # Telethon-based bio/name enforcer
     import profile_enforcer
     await profile_enforcer.main()
 
@@ -140,8 +141,8 @@ async def run_service_loop(
 ) -> None:
     """
     Run a single service with:
-      • pre-flight env check (ok_fn)
-      • restart on crash with exponential-style backoff
+    - pre-flight env check (ok_fn)
+    - restart on crash with backoff
     """
     idx = 0
     padded_name = f"{name:<10}"
@@ -157,8 +158,10 @@ async def run_service_loop(
 
             log.info("[%s] starting…", padded_name)
             await start_fn()
-            # If the service returns instead of running forever, we still restart it.
-            log.warning("[%s] exited normally; restarting after short pause", padded_name)
+            log.warning(
+                "[%s] exited normally; restarting after short pause",
+                padded_name,
+            )
             idx = 0
             await asyncio.sleep(1)
 
@@ -167,7 +170,12 @@ async def run_service_loop(
             raise
         except Exception as e:
             d = backoff_seq[min(idx, len(backoff_seq) - 1)]
-            log.exception("[%s] crashed: %s; restarting in %ss", padded_name, e, d)
+            log.exception(
+                "[%s] crashed: %s; restarting in %ss",
+                padded_name,
+                e,
+                d,
+            )
             await asyncio.sleep(d)
             idx = min(idx + 1, len(backoff_seq) - 1)
 
@@ -177,13 +185,22 @@ async def main() -> None:
     # One instance per bot token! If you run multiple copies,
     # Telegram will throw a conflict error.
     tasks = [
-        asyncio.create_task(run_service_loop("login-bot", _ok_login_bot, _run_login_bot)),
-        asyncio.create_task(run_service_loop("main-bot",  _ok_main_bot,  _run_main_bot)),
-        asyncio.create_task(run_service_loop("worker",    _ok_worker,    _run_worker)),
-        asyncio.create_task(run_service_loop("enforcer",  _ok_enforcer,  _run_enforcer)),
+        asyncio.create_task(
+            run_service_loop("login-bot", _ok_login_bot, _run_login_bot)
+        ),
+        asyncio.create_task(
+            run_service_loop("main-bot", _ok_main_bot, _run_main_bot)
+        ),
+        asyncio.create_task(
+            run_service_loop("worker", _ok_worker, _run_worker)
+        ),
+        asyncio.create_task(
+            run_service_loop("enforcer", _ok_enforcer, _run_enforcer)
+        ),
         asyncio.create_task(heartbeat()),
     ]
 
+    # graceful shutdown
     stop_ev: asyncio.Event = asyncio.Event()
 
     def _stop(*_: object) -> None:
@@ -195,12 +212,10 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, _stop)
         except NotImplementedError:
-            # e.g. Windows or limited event loop
+            # Windows / limited event loop fallback
             signal.signal(sig, lambda *_: _stop())
 
     await stop_ev.wait()
-
-    # graceful cancellation
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -211,5 +226,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # Extra safety for Ctrl+C in some environments
+        # extra safety for Ctrl+C in some environments
         pass
