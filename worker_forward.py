@@ -1,30 +1,12 @@
-# worker_forward.py — Pyrogram-based forward worker using Mongo DB
-#
-# Features:
-#   • Uses sessions stored by SpinifyLoginBot (core.db.sessions_list)
-#   • Commands from logged-in account (filters.me):
-#       .help        — show commands
-#       .gc / .groups — list targets
-#       .addgc       — add targets (@, t.me links, IDs)
-#       .cleargc     — clear targets
-#       .delgc       — remove one target
-#       .time        — set interval (free: 30/45/60, premium: any minutes)
-#       .adreset     — restart Saved Messages cycle
-#       .status      — show plan, groups, interval, next send
-#
-#   • Every interval, picks next Saved Message from "me" and
-#     copy_message() to all configured groups with delay between groups.
-
 import os
 import asyncio
 import logging
-import re
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
-from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, Unauthorized, RPCError
-from pyrogram.types import Message
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import RPCError
 
 from core.db import (
     init_db,
@@ -47,27 +29,23 @@ logging.basicConfig(level=LOG_LEVEL)
 log = logging.getLogger("worker")
 
 PARALLEL_USERS = int(os.getenv("PARALLEL_USERS", "3"))
-PER_GROUP_DELAY = float(os.getenv("PER_GROUP_DELAY", "30"))  # seconds
-SEND_TIMEOUT = int(os.getenv("SEND_TIMEOUT", "60"))           # seconds
-TICK_INTERVAL = int(os.getenv("TICK_INTERVAL", "15"))         # seconds
+PER_GROUP_DELAY = float(os.getenv("PER_GROUP_DELAY", "30"))   # seconds
+SEND_TIMEOUT = int(os.getenv("SEND_TIMEOUT", "60"))            # seconds (used as soft limit)
+TICK_INTERVAL = int(os.getenv("TICK_INTERVAL", "15"))          # seconds
 DEFAULT_INTERVAL_MIN = int(os.getenv("DEFAULT_INTERVAL_MIN", "30"))
 
-# per-user runtime state: {uid: {"apps":[Client...], "idx":int, "saved_ids":[int], "delay":float}}
+# Per-user runtime state
+# STATE[uid] = {
+#   "client": TelegramClient,
+#   "idx": current saved message index,
+#   "saved_ids": [int],
+#   "delay": float,
+# }
 STATE: Dict[int, Dict[str, Any]] = {}
 
 
-# ---------- helpers ----------
-
 def _now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
-
-
-def _panel_is_premium(uid: int) -> bool:
-    """Use DB premium flag; owner can be treated premium if you want."""
-    try:
-        return bool(is_premium(uid))
-    except Exception:
-        return False
 
 
 def _get_state(uid: int) -> Dict[str, Any]:
@@ -116,49 +94,42 @@ def _format_eta(uid: int) -> str:
     return "in ~" + " ".join(parts)
 
 
-async def fetch_saved_ids(app: Client) -> List[int]:
-    """Collect Saved Messages IDs from 'me', oldest → newest."""
+def _panel_is_premium(uid: int) -> bool:
+    try:
+        return bool(is_premium(uid))
+    except Exception:
+        return False
+
+
+async def fetch_saved_ids(client: TelegramClient) -> List[int]:
     ids: List[int] = []
-    async for m in app.get_chat_history("me", limit=1000):
-        if m.text or m.caption or m.media:
+    async for m in client.iter_messages("me", limit=1000):
+        if m.message or m.media:
             ids.append(m.id)
     ids.reverse()
     return ids
 
 
-async def send_copy(app: Client, from_chat, msg_id: int, to_target: str):
-    try:
-        await app.copy_message(chat_id=to_target, from_chat_id=from_chat, message_id=msg_id)
-        return True
-    except FloodWait as fw:
-        log.warning("FloodWait to %s: sleep %ss", to_target, fw.value)
-        await asyncio.sleep(fw.value)
-        return False
-    except Exception as e:
-        log.warning("copy fail → %s: %s", to_target, e)
-        return False
+# ---------- command handlers per user ----------
 
-
-# ---------- command handlers (per session) ----------
-
-def register_session_handlers(app: Client, uid: int) -> None:
-    @app.on_message(filters.me & filters.text)
-    async def my_text(_, msg: Message):
-        t = (msg.text or "").strip()
-        if not t.startswith("."):
+def register_session_handlers(client: TelegramClient, uid: int) -> None:
+    @client.on(events.NewMessage(outgoing=True))
+    async def self_cmd_handler(event: events.NewMessage.Event):
+        text = (event.raw_text or "").strip()
+        if not text.startswith("."):
             return
 
         st = _get_state(uid)
         premium = _panel_is_premium(uid)
-        log.info("[u%s] cmd: %s (premium=%s)", uid, t, premium)
+        log.info("[u%s] cmd: %s (premium=%s)", uid, text, premium)
 
         # .help
-        if t.startswith(".help"):
-            await msg.reply_text(
+        if text.startswith(".help"):
+            await event.reply(
                 "📜 Commands (send from this account)\n"
                 "• <code>.help</code> — this help\n"
                 "• <code>.gc</code> / <code>.groups</code> — list targets\n"
-                "• <code>.addgc</code> — add targets (see below)\n"
+                "• <code>.addgc</code> — add targets (@/t.me/ID)\n"
                 "• <code>.cleargc</code> — clear all targets\n"
                 "• <code>.delgc &lt;target&gt;</code> — remove one\n"
                 "• <code>.time</code> — set interval\n"
@@ -172,53 +143,54 @@ def register_session_handlers(app: Client, uid: int) -> None:
             return
 
         # .gc / .groups
-        if t.startswith(".gc") or t.startswith(".groups"):
+        if text.startswith(".gc") or text.startswith(".groups"):
             targets = list_groups(uid)
             cap = groups_cap(uid)
             if not targets:
-                await msg.reply_text(f"GC list empty (cap {cap}).")
+                await event.reply(f"GC list empty (cap {cap}).")
                 return
             head = f"GC ({len(targets)}/{cap})"
             body = "\n".join(f"• {x}" for x in targets[:100])
             more = "" if len(targets) <= 100 else f"\n… +{len(targets)-100} more"
-            await msg.reply_text(f"{head}\n{body}{more}")
+            await event.reply(f"{head}\n{body}{more}")
             return
 
         # .cleargc
-        if t.startswith(".cleargc"):
+        if text.startswith(".cleargc"):
             clear_groups(uid)
-            await msg.reply_text("✅ Cleared all groups.")
+            await event.reply("✅ Cleared all groups.")
             return
 
         # .addgc
-        if t.startswith(".addgc"):
+        if text.startswith(".addgc"):
             lines: List[str] = []
 
-            # 1) same-line args: ".addgc @g1 @g2"
-            parts = t.split(maxsplit=1)
+            # 1) same-line args
+            parts = text.split(maxlength := 1)
             if len(parts) > 1:
                 for token in parts[1].split():
                     token = token.strip()
                     if token:
                         lines.append(token)
 
-            # 2) extra lines in same message
-            extra = t.splitlines()[1:]
+            # 2) extra lines
+            extra = text.splitlines()[1:]
             for ln in extra:
                 ln = ln.strip()
                 if ln:
                     lines.append(ln)
 
             # 3) reply body
-            if not lines and msg.reply_to_message:
-                body = msg.reply_to_message.text or msg.reply_to_message.caption or ""
-                for ln in body.splitlines():
-                    ln = ln.strip()
-                    if ln:
-                        lines.append(ln)
+            if not lines and event.is_reply:
+                reply_msg = await event.get_reply_message()
+                if reply_msg and (reply_msg.raw_text or ""):
+                    for ln in (reply_msg.raw_text or "").splitlines():
+                        ln = ln.strip()
+                        if ln:
+                            lines.append(ln)
 
             if not lines:
-                await msg.reply_text(
+                await event.reply(
                     "⚠️ No targets found.\n"
                     "Examples:\n"
                     "  <code>.addgc @group1</code>\n"
@@ -234,14 +206,14 @@ def register_session_handlers(app: Client, uid: int) -> None:
                 if len(list_groups(uid)) >= cap:
                     break
 
-            await msg.reply_text(f"✅ Added {added}. Now {len(list_groups(uid))}/{cap}.")
+            await event.reply(f"✅ Added {added}. Now {len(list_groups(uid))}/{cap}.")
             return
 
         # .delgc
-        if t.startswith(".delgc"):
-            parts = t.split(maxsplit=1)
+        if text.startswith(".delgc"):
+            parts = text.split(maxsplit=1)
             if len(parts) < 2:
-                await msg.reply_text("❗ Usage: <code>.delgc &lt;@user or t.me/link&gt;</code>")
+                await event.reply("❗ Usage: <code>.delgc &lt;@user or t.me/link&gt;</code>")
                 return
             target = parts[1].strip()
             targets = list_groups(uid)
@@ -250,34 +222,33 @@ def register_session_handlers(app: Client, uid: int) -> None:
                 clear_groups(uid)
                 for x in targets:
                     add_group(uid, x)
-                await msg.reply_text("✅ Group removed.")
+                await event.reply("✅ Group removed.")
             else:
-                await msg.reply_text("❗ That target is not in your group list.")
+                await event.reply("❗ That target is not in your group list.")
             return
 
-        # .time  (free vs premium)
-        if t.startswith(".time"):
-            tokens = t.split()
+        # .time
+        if text.startswith(".time"):
+            tokens = text.split()
             if len(tokens) == 1:
-                await msg.reply_text(
+                await event.reply(
                     "⏱ Usage:\n"
                     "  Free: <code>.time 30</code>, <code>.time 45</code>, <code>.time 60</code>\n"
                     "  Premium: any minutes, e.g. <code>.time 10</code>, <code>.time 90</code>"
                 )
                 return
-
             try:
                 val = int(tokens[1])
             except Exception:
-                await msg.reply_text("❗ Interval must be integer minutes.")
+                await event.reply("❗ Interval must be integer minutes.")
                 return
 
             if val <= 0:
-                await msg.reply_text("❗ Interval must be > 0.")
+                await event.reply("❗ Interval must be > 0.")
                 return
 
             if not premium and val not in (30, 45, 60):
-                await msg.reply_text(
+                await event.reply(
                     "💎 Custom interval is premium-only.\n"
                     "Free can only use 30, 45 or 60 minutes.\n"
                     "Try: <code>.time 30</code>, <code>.time 45</code>, <code>.time 60</code>"
@@ -285,24 +256,27 @@ def register_session_handlers(app: Client, uid: int) -> None:
                 return
 
             set_interval(uid, val)
-            await msg.reply_text(f"✅ Interval set to <b>{val} minutes</b> ({'Premium' if premium else 'Free'}).")
+            await event.reply(
+                f"✅ Interval set to <b>{val} minutes</b> "
+                f"({'Premium' if premium else 'Free'})."
+            )
             return
 
         # .adreset
-        if t.startswith(".adreset"):
+        if text.startswith(".adreset"):
             st["idx"] = 0
             st["saved_ids"] = []
-            await msg.reply_text("✅ Saved Messages cycle reset to first message.")
+            await event.reply("✅ Saved Messages cycle reset to first message.")
             return
 
         # .status
-        if t.startswith(".status"):
+        if text.startswith(".status"):
             gs = len(list_groups(uid))
             cap = groups_cap(uid)
             interval = get_interval(uid) or DEFAULT_INTERVAL_MIN
             eta = "—" if gs == 0 else _format_eta(uid)
             plan = "Premium 💎" if premium else "Free ⚪"
-            await msg.reply_text(
+            await event.reply(
                 "📊 Status\n"
                 f"• Plan: {plan}\n"
                 f"• Groups: {gs}/{cap}\n"
@@ -314,41 +288,54 @@ def register_session_handlers(app: Client, uid: int) -> None:
 
 # ---------- per-user lifecycle ----------
 
-async def build_clients_for_user(uid: int) -> List[Client]:
-    apps: List[Client] = []
-    for s in sessions_list(uid):
-        try:
-            c = Client(
-                name=f"u{uid}s{s['slot']}",
-                api_id=int(s["api_id"]),
-                api_hash=str(s["api_hash"]),
-                session_string=str(s["session_string"]),
-            )
-            await c.start()
-            register_session_handlers(c, uid)
-            apps.append(c)
-            log.info("[u%s] session slot %s started", uid, s["slot"])
-        except Unauthorized:
-            log.warning("[u%s] session slot %s unauthorized", uid, s.get("slot"))
-        except Exception as e:
-            log.error("[u%s] start session failed slot %s: %s", uid, s.get("slot"), e)
-    return apps
+async def build_client_for_user(uid: int) -> TelegramClient | None:
+    """
+    Use first available session for this uid as sender account.
+    """
+    sess_list = sessions_list(uid)
+    if not sess_list:
+        return None
+
+    s = sess_list[0]
+    api_id = int(s["api_id"])
+    api_hash = str(s["api_hash"])
+    session_str = str(s["session_string"])
+
+    client = TelegramClient(StringSession(session_str), api_id, api_hash)
+    await client.connect()
+    if not await client.is_user_authorized():
+        log.warning("[u%s] session not authorized", uid)
+        await client.disconnect()
+        return None
+
+    register_session_handlers(client, uid)
+    log.info("[u%s] Telethon client started (slot %s)", uid, s.get("slot"))
+    return client
 
 
 async def ensure_state(uid: int):
-    st = STATE.get(uid)
-    if st and st.get("apps"):
+    st = _get_state(uid)
+    if st.get("client") and await st["client"].is_connected():
         return
-    apps = await build_clients_for_user(uid)
-    STATE[uid] = {"apps": apps, "idx": 0, "saved_ids": [], "delay": PER_GROUP_DELAY}
+    # build new client
+    try:
+        client = await build_client_for_user(uid)
+    except Exception as e:
+        log.error("[u%s] build_client error: %s", uid, e)
+        return
+    if client:
+        st["client"] = client
+        st.setdefault("idx", 0)
+        st.setdefault("saved_ids", [])
 
 
 async def refresh_saved(uid: int):
     st = _get_state(uid)
-    if not st.get("apps"):
+    client: TelegramClient = st.get("client")
+    if not client:
         return
     try:
-        saved = await fetch_saved_ids(st["apps"][0])
+        saved = await fetch_saved_ids(client)
         st["saved_ids"] = saved
         log.info("[u%s] loaded %s saved messages", uid, len(saved))
     except Exception as e:
@@ -357,8 +344,8 @@ async def refresh_saved(uid: int):
 
 async def run_cycle(uid: int):
     st = _get_state(uid)
-    apps = st.get("apps") or []
-    if not apps:
+    client: TelegramClient = st.get("client")
+    if not client:
         return
 
     targets = list_groups(uid)
@@ -373,20 +360,32 @@ async def run_cycle(uid: int):
 
     idx = _cur_idx(uid)
     msg_id = st["saved_ids"][idx]
-    app = apps[0]  # use first healthy session
     ok_any = False
+
+    try:
+        msg = await client.get_messages("me", ids=msg_id)
+    except Exception as e:
+        log.error("[u%s] get_messages error for id %s: %s", uid, msg_id, e)
+        # skip this message and move index forward
+        _next_idx(uid, len(st["saved_ids"]))
+        return
+
+    if not msg:
+        _next_idx(uid, len(st["saved_ids"]))
+        return
 
     for tg in targets:
         try:
-            done = await asyncio.wait_for(
-                send_copy(app, "me", msg_id, tg),
-                timeout=SEND_TIMEOUT,
-            )
-            if done:
-                ok_any = True
-                inc_sent_ok(uid, 1)
+            await asyncio.wait_for(msg.forward_to(tg), timeout=SEND_TIMEOUT)
+            ok_any = True
+            inc_sent_ok(uid, 1)
+            log.info("[u%s] forwarded msg %s to %s", uid, msg_id, tg)
         except asyncio.TimeoutError:
             log.warning("[u%s] send timeout to %s", uid, tg)
+        except RPCError as e:
+            log.warning("[u%s] RPCError while sending to %s: %s", uid, tg, e)
+        except Exception as e:
+            log.warning("[u%s] error forwarding to %s: %s", uid, tg, e)
         await asyncio.sleep(st["delay"])
 
     if ok_any:
@@ -396,6 +395,11 @@ async def run_cycle(uid: int):
 
 async def user_loop(uid: int):
     await ensure_state(uid)
+    st = _get_state(uid)
+    client: TelegramClient = st.get("client")
+    if not client:
+        return
+
     interval = get_interval(uid) or DEFAULT_INTERVAL_MIN
     last = get_last_sent_at(uid)
     now = _now_ts()
@@ -407,7 +411,7 @@ async def user_loop(uid: int):
 
 async def main_loop():
     init_db()
-    log.info("worker started (Pyrogram)")
+    log.info("worker started (Telethon)")
 
     while True:
         uids = users_with_sessions()
@@ -417,10 +421,6 @@ async def main_loop():
             async with sem:
                 try:
                     await user_loop(u)
-                except Unauthorized:
-                    log.warning("[u%s] Unauthorized in loop", u)
-                except RPCError as e:
-                    log.error("[u%s] RPCError: %s", u, e)
                 except Exception as e:
                     log.error("loop error u%s: %s", u, e)
 
@@ -435,6 +435,14 @@ async def main():
         await main_loop()
     except KeyboardInterrupt:
         log.info("worker stopped by KeyboardInterrupt")
+        # graceful shutdown of clients
+        for uid, st in STATE.items():
+            client = st.get("client")
+            if client:
+                try:
+                    asyncio.create_task(client.disconnect())
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
