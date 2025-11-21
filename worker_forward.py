@@ -1,585 +1,533 @@
 import os
-import json
 import asyncio
 import logging
-import sqlite3
-import re
-from datetime import datetime, date, time, timedelta
-from typing import Tuple
-
-try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-except Exception:
-    ZoneInfo = None  # will fall back to local time without TZ
+from datetime import datetime, timezone
+from typing import Dict, Any, List
 
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError, RPCError
+from telethon.sessions import StringSession
+from telethon.errors import RPCError
 
 from core.db import (
     init_db,
-    is_premium, set_premium,
-    get_voucher, mark_voucher_used,
+    users_with_sessions,
+    sessions_list,
+    list_groups,
+    add_group,
+    clear_groups,
+    groups_cap,
+    get_interval,
+    set_interval,
+    get_last_sent_at,
+    mark_sent_now,
+    inc_sent_ok,
+    is_premium,
 )
 
-# =========================
-# Auto-Night configuration
-# =========================
-AUTONIGHT_PATH = os.path.join(os.path.dirname(__file__), "autonight.json")
-DEFAULT_AUTONIGHT = {
-    "enabled": True,
-    "start": "23:00",        # 24h format HH:MM
-    "end": "07:00",          # 24h format HH:MM
-    "tz": "Asia/Kolkata"
-}
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
+log = logging.getLogger("worker")
+
+PARALLEL_USERS = int(os.getenv("PARALLEL_USERS", "3"))
+PER_GROUP_DELAY = float(os.getenv("PER_GROUP_DELAY", "30"))   # seconds
+SEND_TIMEOUT = int(os.getenv("SEND_TIMEOUT", "60"))            # seconds
+TICK_INTERVAL = int(os.getenv("TICK_INTERVAL", "15"))          # seconds
+DEFAULT_INTERVAL_MIN = int(os.getenv("DEFAULT_INTERVAL_MIN", "30"))
+
+# Shown to user when they need premium
+PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "@spinify")
+
+# Per-user runtime state
+# STATE[uid] = {
+#   "client": TelegramClient,
+#   "idx": current saved message index,
+#   "saved_ids": [int],
+#   "delay": float,
+# }
+STATE: Dict[int, Dict[str, Any]] = {}
 
 
-def _load_autonight() -> dict:
-    cfg = DEFAULT_AUTONIGHT.copy()
+def _now_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def _get_state(uid: int) -> Dict[str, Any]:
+    st = STATE.setdefault(uid, {})
+    if "idx" not in st:
+        st["idx"] = 0
+    if "saved_ids" not in st:
+        st["saved_ids"] = []
+    if "delay" not in st:
+        st["delay"] = PER_GROUP_DELAY
+    return st
+
+
+def _cur_idx(uid: int) -> int:
+    return int(_get_state(uid).get("idx", 0))
+
+
+def _next_idx(uid: int, n: int) -> int:
+    st = _get_state(uid)
+    if n <= 0:
+        st["idx"] = 0
+        return 0
+    i = (int(st.get("idx", 0)) + 1) % n
+    st["idx"] = i
+    return i
+
+
+def _format_eta(uid: int) -> str:
+    """
+    Human ETA for next send.
+
+    Behaviour:
+      - If never sent: show full interval (e.g., 'in ~30m (first cycle)')
+      - If overdue / very close: show 'very soon'
+      - Otherwise: 'in ~Xm Ys'
+    """
+    interval = get_interval(uid) or DEFAULT_INTERVAL_MIN
+    last = get_last_sent_at(uid)
+
+    # Never sent yet
+    if last is None:
+        return f"in ~{interval}m (first cycle)"
+
+    now = _now_ts()
+    left = interval * 60 - (now - int(last))
+
+    # Already due or within a few seconds → show "very soon"
+    if left <= 5:
+        return "very soon"
+
+    h, rem = divmod(left, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    if s and not parts:
+        parts.append(f"{s}s")
+
+    return "in ~" + " ".join(parts)
+
+
+def _panel_is_premium(uid: int) -> bool:
     try:
-        if os.path.exists(AUTONIGHT_PATH):
-            with open(AUTONIGHT_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                cfg.update({k: data.get(k, cfg[k]) for k in cfg})
+        return bool(is_premium(uid))
     except Exception:
-        pass
-    return cfg
-
-
-def _save_autonight(cfg: dict) -> None:
-    try:
-        with open(AUTONIGHT_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def _parse_hhmm(s: str) -> time:
-    s = s.strip()
-    # Accept "7", "07", "7:00", "07:00"
-    if re.fullmatch(r"\d{1,2}", s):
-        h = int(s)
-        if not (0 <= h <= 23):
-            raise ValueError("Hour must be 0..23")
-        return time(h, 0)
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
-    if not m:
-        raise ValueError("Time must be HH or HH:MM (24h)")
-    h, mm = int(m.group(1)), int(m.group(2))
-    if not (0 <= h <= 23 and 0 <= mm <= 59):
-        raise ValueError("Invalid time")
-    return time(h, mm)
-
-
-def _get_now_tz(tz_name: str) -> datetime:
-    if ZoneInfo is not None:
-        try:
-            return datetime.now(ZoneInfo(tz_name))
-        except Exception:
-            pass
-    # Fallback: naive local time
-    return datetime.now()
-
-
-def _in_window(now_t: time, start_t: time, end_t: time) -> bool:
-    """True if now is within [start, end) with midnight wrap support."""
-    if start_t <= end_t:
-        return start_t <= now_t < end_t
-    # crosses midnight, e.g., 23:00 -> 07:00
-    return (now_t >= start_t) or (now_t < end_t)
-
-
-def _seconds_until_quiet_end(cfg: dict) -> int:
-    """Return seconds until the end of quiet window (>= 1), assuming we are currently in quiet."""
-    tz = cfg.get("tz") or DEFAULT_AUTONIGHT["tz"]
-    now = _get_now_tz(tz)
-    start_t = _parse_hhmm(cfg.get("start", DEFAULT_AUTONIGHT["start"]))
-    end_t   = _parse_hhmm(cfg.get("end", DEFAULT_AUTONIGHT["end"]))
-    today = now.date()
-
-    # Compute next end datetime
-    if start_t <= end_t:
-        # non-wrapping window (e.g., 02:00 -> 05:00)
-        end_dt = datetime.combine(today, end_t, tzinfo=now.tzinfo)
-        if now.time() >= end_t:
-            end_dt = end_dt + timedelta(days=1)
-    else:
-        # wrapping window (e.g., 23:00 -> 07:00)
-        if now.time() < end_t:
-            end_dt = datetime.combine(today, end_t, tzinfo=now.tzinfo)
-        else:
-            end_dt = datetime.combine(today + timedelta(days=1), end_t, tzinfo=now.tzinfo)
-
-    seconds = int((end_dt - now).total_seconds())
-    return max(1, seconds)
-
-
-def autonight_is_quiet(cfg: dict) -> bool:
-    if not cfg.get("enabled", True):
-        return False
-    try:
-        now = _get_now_tz(cfg.get("tz", DEFAULT_AUTONIGHT["tz"]))
-        start_t = _parse_hhmm(cfg.get("start", DEFAULT_AUTONIGHT["start"]))
-        end_t   = _parse_hhmm(cfg.get("end", DEFAULT_AUTONIGHT["end"]))
-        return _in_window(now.time(), start_t, end_t)
-    except Exception:
-        # Fail open if config broken
         return False
 
 
-def autonight_status_text(cfg: dict) -> str:
-    state = "ON ✅" if cfg.get("enabled", True) else "OFF ❌"
-    return (
-        f"🌙 Auto-Night: {state}\n"
-        f"Window: {cfg.get('start','23:00')} → {cfg.get('end','07:00')}\n"
-        f"TZ: {cfg.get('tz','Asia/Kolkata')}"
-    )
-
-
-def autonight_parse_command(arg: str, cfg: dict) -> Tuple[str, dict]:
+def _is_control_message_text(text: str | None) -> bool:
     """
-    Returns (message_text, updated_cfg or same).
-    Supported:
-      .night
-      .night on | off
-      .night 23:00 to 07:00   (also supports -, – , —)
-      .night 23-7
+    Any message that starts with '.' (after stripping spaces) is treated as a control/command.
+    We never forward such messages to groups.
     """
-    arg = (arg or "").strip()
-    if not arg:
-        return (autonight_status_text(cfg), cfg)
-
-    low = arg.lower()
-    if low in {"on", "enable", "enabled"}:
-        cfg = cfg.copy()
-        cfg["enabled"] = True
-        _save_autonight(cfg)
-        return ("✅ Auto-Night enabled.\n" + autonight_status_text(cfg), cfg)
-
-    if low in {"off", "disable", "disabled"}:
-        cfg = cfg.copy()
-        cfg["enabled"] = False
-        _save_autonight(cfg)
-        return ("🚫 Auto-Night disabled.\n" + autonight_status_text(cfg), cfg)
-
-    # Time range
-    m = re.fullmatch(
-        r"\s*(\d{1,2}(?::\d{2})?)\s*(?:to|–|—|-)\s*(\d{1,2}(?::\d{2})?)\s*",
-        arg
-    )
-    if not m:
-        return (
-            "❗ Format: ✹ .night 23:00 to 07:00 ✹\n"
-            "Also works: ✹ .night 23:00-07:00 ✹ (24-hour times).",
-            cfg
-        )
-
-    start_raw, end_raw = m.group(1), m.group(2)
-    try:
-        start_t = _parse_hhmm(start_raw)
-        end_t   = _parse_hhmm(end_raw)
-    except ValueError as e:
-        return (f"❗ {e}", cfg)
-
-    cfg = cfg.copy()
-    cfg["start"] = f"{start_t.hour:02d}:{start_t.minute:02d}"
-    cfg["end"]   = f"{end_t.hour:02d}:{end_t.minute:02d}"
-    _save_autonight(cfg)
-    return (
-        f"🕒 Auto-Night window updated:\n"
-        f"{cfg['start']} → {cfg['end']} ({cfg.get('tz','Asia/Kolkata')})\n"
-        + autonight_status_text(cfg),
-        cfg,
-    )
-
-
-# =========================
-# Forwarder logic + premium
-# =========================
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-USERS_DIR = "users"
-SESSIONS_DIR = "sessions"
-clients = {}
-started_phones = set()
-
-AUTONIGHT_CFG = _load_autonight()
-
-UPGRADE_CONTACT = os.getenv("UPGRADE_CONTACT", "@SpinifyAdsBot")
-DEVELOPER_ID = 7876302875  # always premium
+    if not text:
+        return False
+    return text.lstrip().startswith(".")
 
 
 def _is_control_message(msg) -> bool:
+    return _is_control_message_text(getattr(msg, "message", None))
+
+
+async def fetch_saved_ids(client: TelegramClient) -> List[int]:
     """
-    True if this Saved Message looks like a command (.help/.time/...), so we do NOT forward it.
+    Get IDs of Saved Messages (oldest → newest), only those with text or media.
+    Also SKIP any message whose text starts with '.' (commands).
     """
-    txt = (getattr(msg, "raw_text", None) or "").strip()
-    if not txt:
-        return False
-    return txt.startswith(".")
+    ids: List[int] = []
+    async for m in client.iter_messages("me", limit=1000):
+        if not (m.message or m.media):
+            continue
+        # skip command-style messages from Saved
+        if _is_control_message(m):
+            continue
+        ids.append(m.id)
+    ids.reverse()
+    return ids
 
 
-async def run_user_bot(config):
-    phone = config["phone"]
-    if phone in started_phones:
-        return
+# ---------- command handlers per user ----------
 
-    session_path = os.path.join(SESSIONS_DIR, f"{phone}.session")
-    api_id = int(config["api_id"])
-    api_hash = config["api_hash"]
-    groups = config.get("groups", [])
-    delay = config.get("msg_delay_sec", 5)
-    cycle = config.get("cycle_delay_min", 15)
-
-    user_state = {
-        "delay": delay,   # seconds between forwards
-        "cycle": cycle,   # minutes between cycles
-    }
-
-    client = TelegramClient(session_path, api_id, api_hash)
-
-    try:
-        await client.start()
-    except sqlite3.OperationalError as e:
-        logger.error(f"[{phone}] SQLite lock error: {e}")
-        return
-    except SessionPasswordNeededError:
-        logger.error(f"[{phone}] 2FA password required. Skipping.")
-        return
-    except RPCError as e:
-        logger.error(f"[{phone}] RPC Error: {e}")
-        return
-    except Exception as e:
-        logger.exception(f"[{phone}] Failed to start client: {e}")
-        return
-
-    started_phones.add(phone)
-    logger.info(f"[✔] Started bot for {config.get('name','N/A')} ({phone})")
-
-    # ---------- COMMAND HANDLER ----------
+def register_session_handlers(client: TelegramClient, uid: int) -> None:
     @client.on(events.NewMessage(outgoing=True))
-    async def command_handler(event):
-        """Commands: only outgoing messages from this account."""
+    async def self_cmd_handler(event: events.NewMessage.Event):
         text = (event.raw_text or "").strip()
         if not text.startswith("."):
             return
 
-        me = await client.get_me()
-        uid = int(me.id)
+        st = _get_state(uid)
+        premium = _panel_is_premium(uid)
+        log.info("[u%s] cmd: %s (premium=%s)", uid, text, premium)
 
-        # premium from DB
-        premium = is_premium(uid)
-        if uid == DEVELOPER_ID:
-            premium = True
+        # .help
+        if text.startswith(".help"):
+            await event.reply(
+                "📜 ✹ Self Commands ✹\n"
+                "• .help  — show this help\n"
+                "• .gc / .groups  — list targets\n"
+                "• .addgc         — add targets (@ / t.me / ID)\n"
+                "• .cleargc       — clear all targets\n"
+                "• .delgc <target> — remove one target\n"
+                "• .time          — set interval\n"
+                "• .adreset       — restart Saved cycle\n"
+                "• .status        — show plan + ETA\n\n"
+                "🧷 .addgc usage:\n"
+                "  1) .addgc @group1 @group2\n"
+                "  2) .addgc  (then paste one per line)\n"
+                "  3) Reply to a message that has @ / t.me links and send .addgc\n\n"
+                f"💎 Premium upgrade: contact {PREMIUM_CONTACT}"
+            )
+            return
 
-        logger.info(f"[{phone}] cmd: {text!r} premium={premium}")
-
-        # ----- TIME -----
-        if text.startswith(".time"):
-            value_str = ''.join(filter(str.isdigit, text)) or "0"
-            value = int(value_str)
-            if value <= 0:
+        # .gc / .groups
+        if text.startswith(".gc") or text.startswith(".groups"):
+            targets = list_groups(uid)
+            cap = groups_cap(uid)
+            if not targets:
                 await event.reply(
-                    "❗ Usage (free): ✹ .time 30 ✹ / ✹ .time 45 ✹ / ✹ .time 60 ✹\n"
-                    "Premium can also use ✹ .time 10 ✹ / ✹ .time 90 ✹ / ✹ .time 2h ✹ etc."
+                    f"🎯 Target list is empty (0/{cap}).\n"
+                    "Use .addgc to add groups."
                 )
                 return
 
-            if not premium:
-                if value not in (30, 45, 60):
-                    await event.reply(
-                        "💎 Custom interval is a premium feature.\n"
-                        "Free users can only use:\n"
-                        "  • ✹ .time 30 ✹\n"
-                        "  • ✹ .time 45 ✹\n"
-                        "  • ✹ .time 60 ✹\n"
-                        f"For more, ask for a code from {UPGRADE_CONTACT} and use ✹ .redeem CODE ✹."
-                    )
-                    return
-                user_state["cycle"] = value
-                await event.reply(f"✅ Interval set to {value} minutes (free plan).")
+            lines = [f"{i+1:02d}. {g}" for i, g in enumerate(targets)]
+            head = f"🎯 Targets ({len(targets)}/{cap})"
+            await event.reply(f"{head}\n" + "\n".join(lines))
+            return
+
+        # .cleargc
+        if text.startswith(".cleargc"):
+            clear_groups(uid)
+            await event.reply(
+                f"✅ Cleared all group targets (0/{groups_cap(uid)})."
+            )
+            return
+
+        # .addgc
+        if text.startswith(".addgc"):
+            lines: List[str] = []
+
+            # 1) same-line args
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                for token in parts[1].split():
+                    token = token.strip()
+                    if token:
+                        lines.append(token)
+
+            # 2) extra lines (multi-line paste)
+            extra = text.splitlines()[1:]
+            for ln in extra:
+                ln = ln.strip()
+                if ln:
+                    lines.append(ln)
+
+            # 3) reply body
+            if not lines and event.is_reply:
+                reply_msg = await event.get_reply_message()
+                if reply_msg and (reply_msg.raw_text or ""):
+                    for ln in (reply_msg.raw_text or "").splitlines():
+                        ln = ln.strip()
+                        if ln:
+                            lines.append(ln)
+
+            if not lines:
+                await event.reply(
+                    "⚠️ No targets found.\n"
+                    "Examples:\n"
+                    "  .addgc @group1\n"
+                    "  .addgc   (then paste one per line)\n"
+                    "  Or reply to a message that contains @usernames / t.me links and send .addgc"
+                )
                 return
 
-            # PREMIUM → full custom support with optional 'h'
-            if 'h' in text.lower():
-                user_state["cycle"] = value * 60
+            added = 0
+            cap = groups_cap(uid)
+            for ln in lines:
+                added += add_group(uid, ln.strip())
+                if len(list_groups(uid)) >= cap:
+                    break
+
+            now_count = len(list_groups(uid))
+            await event.reply(
+                f"✅ Added {added} target(s).\n"
+                f"🎯 Now linked: {now_count}/{cap} groups."
+            )
+            return
+
+        # .delgc
+        if text.startswith(".delgc"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await event.reply(
+                    "❗ Usage: .delgc <@user or t.me/link>"
+                )
+                return
+            target = parts[1].strip()
+            targets = list_groups(uid)
+            if target in targets:
+                targets.remove(target)
+                clear_groups(uid)
+                for x in targets:
+                    add_group(uid, x)
+                await event.reply(
+                    f"✅ Group {target} removed."
+                )
             else:
-                user_state["cycle"] = value
-            await event.reply(f"✅ Cycle delay set to {user_state['cycle']} minutes (premium).")
-
-        # ----- PREMIUM-ONLY: .delay -----
-        elif text.startswith(".delay"):
-            if not premium:
                 await event.reply(
-                    "💎 Custom delay is a premium feature.\n"
-                    f"Ask {UPGRADE_CONTACT} for a code and use ✹ .redeem CODE ✹."
+                    "❗ That target is not in your group list."
+                )
+            return
+
+        # .time
+        if text.startswith(".time"):
+            tokens = text.split()
+            if len(tokens) == 1:
+                await event.reply(
+                    "⏱ Usage:\n"
+                    "  Free: .time 30, .time 45, .time 60\n"
+                    "  Premium: any minutes, e.g. .time 10, .time 90\n\n"
+                    f"💎 Upgrade contact: {PREMIUM_CONTACT}"
                 )
                 return
-            value_str = ''.join(filter(str.isdigit, text)) or "0"
-            value = int(value_str)
-            if value <= 0:
-                await event.reply("❗ Usage: ✹ .delay 5 ✹ (seconds)")
+            try:
+                val = int(tokens[1])
+            except Exception:
+                await event.reply("❗ Interval must be integer minutes.")
                 return
-            user_state["delay"] = value
-            await event.reply(f"✅ Message delay set to {value} seconds.")
 
-        # ----- STATUS -----
-        elif text.startswith(".status"):
-            plan = "Premium ✅" if premium else "Free ⚪"
+            if val <= 0:
+                await event.reply("❗ Interval must be > 0.")
+                return
+
+            if not premium and val not in (30, 45, 60):
+                await event.reply(
+                    "💎 Custom interval is premium-only.\n"
+                    "Free can only use 30, 45 or 60 minutes.\n"
+                    "Try: .time 30 / .time 45 / .time 60\n\n"
+                    f"For upgrade, contact {PREMIUM_CONTACT}."
+                )
+                return
+
+            set_interval(uid, val)
+            await event.reply(
+                f"✅ Interval set to {val} minutes "
+                f"({'Premium' if premium else 'Free'} plan)."
+            )
+            return
+
+        # .adreset
+        if text.startswith(".adreset"):
+            st["idx"] = 0
+            st["saved_ids"] = []
+            await event.reply(
+                "✅ Saved Messages cycle reset to first message."
+            )
+            return
+
+        # .status
+        if text.startswith(".status"):
+            gs = len(list_groups(uid))
+            cap = groups_cap(uid)
+            interval = get_interval(uid) or DEFAULT_INTERVAL_MIN
+            eta = "—" if gs == 0 else _format_eta(uid)
+            plan = "Premium 💎" if premium else "Free ⚪"
             await event.reply(
                 "📊 Status\n"
                 f"• Plan: {plan}\n"
-                f"• Cycle Delay: {user_state['cycle']} minutes\n"
-                f"• Message Delay: {user_state['delay']} seconds\n\n"
-                + autonight_status_text(AUTONIGHT_CFG)
+                f"• Groups: {gs}/{cap}\n"
+                f"• Interval: {interval} min\n"
+                f"• Next send: {eta}\n\n"
+                f"💎 Upgrade: contact {PREMIUM_CONTACT}"
             )
+            return
 
-        # ----- INFO -----
-        elif text.startswith(".info"):
-            expiry = config.get("plan_expiry", "N/A")
-            plan = "Premium" if premium else "Free"
-            reply = (
-                "❀ User Info\n"
-                f"❀ Name: {config.get('name')}\n"
-                f"❀ Phone: {phone}\n"
-                f"❀ Telegram ID: {uid}\n"
-                f"❀ Plan: {plan}\n"
-                f"❀ Cycle Delay: {user_state['cycle']} min\n"
-                f"❀ Message Delay: {user_state['delay']} sec\n"
-                f"❀ Groups: {len(groups)}\n"
-                f"❀ Legacy Plan Expiry (if any): {expiry}\n\n"
-                + autonight_status_text(AUTONIGHT_CFG)
-            )
-            await event.reply(reply)
+        # (future) .redeem CODE can be added here once DB-side redeem is ready
+        # if text.startswith(".redeem"):
+        #     ...
 
-        # ----- REDEEM PREMIUM CODE -----
-        elif text.startswith(".redeem"):
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                await event.reply("Usage: ✹ .redeem SPN-XXXXXX ✹")
+
+# ---------- per-user lifecycle ----------
+
+async def build_client_for_user(uid: int) -> TelegramClient | None:
+    """
+    Use first available session for this uid as sender account.
+    """
+    sess_list = sessions_list(uid)
+    if not sess_list:
+        return None
+
+    s = sess_list[0]
+    api_id = int(s["api_id"])
+    api_hash = str(s["api_hash"])
+    session_str = str(s["session_string"])
+
+    client = TelegramClient(StringSession(session_str), api_id, api_hash)
+    await client.connect()
+    if not await client.is_user_authorized():
+        log.warning("[u%s] session not authorized", uid)
+        await client.disconnect()
+        return None
+
+    register_session_handlers(client, uid)
+    log.info("[u%s] Telethon client started (slot %s)", uid, s.get("slot"))
+    return client
+
+
+async def ensure_state(uid: int):
+    st = _get_state(uid)
+    client = st.get("client")
+    if client is not None:
+        try:
+            if await client.is_connected():
                 return
+        except Exception:
+            pass
 
-            code = parts[1].strip().upper()
-
-            v = get_voucher(code)
-            if not v:
-                await event.reply("❌ Invalid or unknown code.")
-                return
-
-            if v.get("used"):
-                await event.reply("⚠️ This code has already been used.")
-                return
-
-            allowed_uid = v.get("user_id")
-            if allowed_uid is not None and int(allowed_uid) != uid:
-                await event.reply(
-                    "⚠️ This code is locked to a different user.\n"
-                    f"If you think this is a mistake, contact {UPGRADE_CONTACT}."
-                )
-                return
-
-            # activate premium on this Telegram user
-            set_premium(uid, True)
-            mark_voucher_used(code, uid)
-
-            await event.reply(
-                "💎 Premium activated!\n"
-                "You now have:\n"
-                "  • Custom interval: ✹ .time <value>[m|h] ✹\n"
-                "  • Custom delay: ✹ .delay <sec> ✹\n"
-                "  • Auto-Night: ✹ .night ✹ commands"
-            )
-
-        # ----- GROUPS ADD -----
-        elif text.startswith(".addgroup"):
-            pattern = r"(https?://t\.me/\S+|t\.me/\S+|@\w+)"
-            links = re.findall(pattern, text)
-
-            if event.is_reply and not links:
-                reply_msg = await event.get_reply_message()
-                if reply_msg and reply_msg.raw_text:
-                    links = re.findall(pattern, reply_msg.raw_text)
-
-            if not links:
-                await event.reply(
-                    "⚠️ No valid group links or usernames found.\n"
-                    "Example: ✹ .addgroup https://t.me/yourgc ✹ or ✹ .addgroup @yourgc ✹"
-                )
-                return
-
-            added, skipped = [], []
-            for link in links:
-                if link not in groups:
-                    groups.append(link)
-                    added.append(link)
-                else:
-                    skipped.append(link)
-
-            config["groups"] = groups
-            try:
-                os.makedirs(USERS_DIR, exist_ok=True)
-                with open(os.path.join(USERS_DIR, f"{phone}.json"), "w", encoding="utf-8") as f:
-                    json.dump(config, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                logger.error(f"[{phone}] Error saving user config: {e}")
-
-            msg_parts = []
-            if added:
-                msg_parts.append(f"✅ Added {len(added)} new group(s).")
-            if skipped:
-                msg_parts.append(f"⚠️ Skipped {len(skipped)} duplicate(s).")
-            await event.reply("\n".join(msg_parts) or "No changes.")
-
-        # ----- GROUPS DEL -----
-        elif text.startswith(".delgroup"):
-            parts = text.split()
-            if len(parts) == 2 and parts[1] in groups:
-                groups.remove(parts[1])
-                config["groups"] = groups
-                try:
-                    with open(os.path.join(USERS_DIR, f"{phone}.json"), "w", encoding="utf-8") as f:
-                        json.dump(config, f, ensure_ascii=False, indent=2)
-                except Exception as e:
-                    logger.error(f"[{phone}] Error saving user config on delgroup: {e}")
-                await event.reply("❀ Group removed.")
-            else:
-                await event.reply(
-                    "❗ Usage: ✹ .delgroup https://t.me/yourgc ✹ or ✹ .delgroup @yourgc ✹"
-                )
-
-        # ----- GROUPS LIST -----
-        elif text.startswith(".groups"):
-            if groups:
-                lines = [f"{i+1}. {g}" for i,g in enumerate(groups)]
-                txt = "❀ Groups:\n" + "\n".join(lines)
-                await event.reply(txt)
-            else:
-                await event.reply("📋 No groups configured.")
-
-        # ----- PREMIUM-ONLY: NIGHT -----
-        elif text.startswith(".night"):
-            if not premium:
-                await event.reply(
-                    "💎 Auto-Night is a premium feature.\n"
-                    f"Ask {UPGRADE_CONTACT} for a code and use ✹ .redeem CODE ✹."
-                )
-                return
-            arg = text[6:].strip() if len(text) > 6 else ""
-            msg_text, new_cfg = autonight_parse_command(arg, AUTONIGHT_CFG)
-            for k in list(AUTONIGHT_CFG.keys()):
-                AUTONIGHT_CFG[k] = new_cfg.get(k, AUTONIGHT_CFG[k])
-            await event.reply(msg_text)
-
-        # ----- HELP -----
-        elif text.startswith(".help"):
-            await event.reply(
-                "🛠 Available Commands\n"
-                "Free:\n"
-                "• ✹ .status ✹ – status + plan + Auto-Night\n"
-                "• ✹ .info ✹ – account info\n"
-                "• ✹ .groups ✹ – list groups\n"
-                "• ✹ .addgroup <url/@user ...> ✹ – add group(s)\n"
-                "• ✹ .delgroup <url/@user> ✹ – remove group\n"
-                "• ✹ .time 30|45|60 ✹ – basic interval (minutes)\n"
-                "• ✹ .redeem CODE ✹ – activate premium code\n\n"
-                "Premium only:\n"
-                "• ✹ .time <value>[m|h] ✹ – custom interval (e.g. 10, 90, 2h)\n"
-                "• ✹ .delay <sec> ✹ – custom delay between messages\n"
-                "• ✹ .night / .night on|off / .night 23:00-07:00 ✹ – Auto-Night"
-            )
-
-    # ---------- Forward loop ----------
-    async def forward_loop():
-        while True:
-            try:
-                if autonight_is_quiet(AUTONIGHT_CFG):
-                    secs = _seconds_until_quiet_end(AUTONIGHT_CFG)
-                    mins = max(1, secs // 60)
-                    logger.info(f"[{phone}] 🌙 Auto-Night active. Sleeping ~{mins} min (until window ends).")
-                    await asyncio.sleep(secs)
-                    continue
-
-                messages = await client.get_messages("me", limit=100)
-                messages = list(reversed(messages))
-
-                interrupted_by_night = False
-
-                for msg in messages:
-                    # skip empty
-                    if msg.raw_text is None and not msg.media:
-                        continue
-
-                    # 🚫 don't forward commands (.help, .time, .redeem, etc.)
-                    if _is_control_message(msg):
-                        continue
-
-                    if autonight_is_quiet(AUTONIGHT_CFG):
-                        interrupted_by_night = True
-                        logger.info(f"[{phone}] Entered Auto-Night mid-cycle. Pausing forwards.")
-                        break
-
-                    for group in groups:
-                        try:
-                            await client.forward_messages(group, msg)
-                            logger.info(f"[{phone}] Forwarded to {group}")
-                        except Exception as e:
-                            logger.warning(f"[{phone}] Error forwarding to {group}: {e}")
-
-                    await asyncio.sleep(user_state["delay"])
-
-                if interrupted_by_night:
-                    secs = _seconds_until_quiet_end(AUTONIGHT_CFG)
-                    mins = max(1, secs // 60)
-                    logger.info(f"[{phone}] 🌙 Auto-Night active. Sleeping ~{mins} min.")
-                    await asyncio.sleep(secs)
-                    continue
-
-                logger.info(f"[{phone}] Cycle complete. Sleeping for {user_state['cycle']} minutes...")
-                await asyncio.sleep(user_state["cycle"] * 60)
-
-            except Exception as e:
-                logger.exception(f"[{phone}] Error in forward loop: {e}")
-                await asyncio.sleep(60)
-
-    asyncio.create_task(forward_loop())
-    await client.run_until_disconnected()
+    # build new client
+    try:
+        client = await build_client_for_user(uid)
+    except Exception as e:
+        log.error("[u%s] build_client error: %s", uid, e)
+        return
+    if client:
+        st["client"] = client
+        st.setdefault("idx", 0)
+        st.setdefault("saved_ids", [])
 
 
-async def user_loader():
-    init_db()  # make sure Mongo ready for vouchers/premium
+async def refresh_saved(uid: int):
+    st = _get_state(uid)
+    client: TelegramClient = st.get("client")
+    if not client:
+        return
+    try:
+        saved = await fetch_saved_ids(client)
+        st["saved_ids"] = saved
+        log.info("[u%s] loaded %s saved messages", uid, len(saved))
+    except Exception as e:
+        log.error("[u%s] fetch_saved_ids error: %s", uid, e)
+
+
+async def run_cycle(uid: int):
+    """
+    Simple logic:
+      - Take next Saved Message (by index)
+      - Forward to all groups
+      - Move index forward
+      - Never forward messages that start with '.'
+    """
+    st = _get_state(uid)
+    client: TelegramClient = st.get("client")
+    if not client:
+        return
+
+    targets = list_groups(uid)
+    if not targets:
+        return
+
+    if not st["saved_ids"]:
+        await refresh_saved(uid)
+    if not st["saved_ids"]:
+        log.info("[u%s] no saved messages", uid)
+        return
+
+    idx = _cur_idx(uid)
+    msg_id = st["saved_ids"][idx]
+    ok_any = False
+
+    try:
+        msg = await client.get_messages("me", ids=msg_id)
+    except Exception as e:
+        log.error("[u%s] get_messages error for id %s: %s", uid, msg_id, e)
+        # skip this message and move index forward
+        _next_idx(uid, len(st["saved_ids"]))
+        return
+
+    if not msg:
+        _next_idx(uid, len(st["saved_ids"]))
+        return
+
+    # hard guard: never forward command-style messages, even if they slipped into saved_ids
+    if _is_control_message(msg):
+        log.info("[u%s] skipping control Saved msg %s", uid, msg_id)
+        _next_idx(uid, len(st["saved_ids"]))
+        return
+
+    for tg in targets:
+        try:
+            await asyncio.wait_for(msg.forward_to(tg), timeout=SEND_TIMEOUT)
+            ok_any = True
+            inc_sent_ok(uid, 1)
+            log.info("[u%s] forwarded msg %s to %s", uid, msg_id, tg)
+        except asyncio.TimeoutError:
+            log.warning("[u%s] send timeout to %s", uid, tg)
+        except RPCError as e:
+            log.warning("[u%s] RPCError while sending to %s: %s", uid, tg, e)
+        except Exception as e:
+            log.warning("[u%s] error forwarding to %s: %s", uid, tg, e)
+        await asyncio.sleep(st["delay"])
+
+    if ok_any:
+        mark_sent_now(uid)
+        _next_idx(uid, len(st["saved_ids"]))
+
+
+async def user_loop(uid: int):
+    await ensure_state(uid)
+    st = _get_state(uid)
+    client: TelegramClient = st.get("client")
+    if not client:
+        return
+
+    interval = get_interval(uid) or DEFAULT_INTERVAL_MIN
+    last = get_last_sent_at(uid)
+    now = _now_ts()
+    if last is None or (now - last) >= interval * 60:
+        await run_cycle(uid)
+
+
+# ---------- main loop ----------
+
+async def main_loop():
+    init_db()
+    log.info("worker started (Telethon)")
+
     while True:
-        os.makedirs(USERS_DIR, exist_ok=True)
-        for file in os.listdir(USERS_DIR):
-            if file.endswith(".json"):
-                path = os.path.join(USERS_DIR, file)
+        uids = users_with_sessions()
+        sem = asyncio.Semaphore(PARALLEL_USERS)
+
+        async def run_one(u: int):
+            async with sem:
                 try:
-                    with open(path, 'r', encoding="utf-8") as f:
-                        config = json.load(f)
-                        expiry = config.get("plan_expiry")
-                        if expiry:
-                            try:
-                                if datetime.now() > datetime.fromisoformat(expiry):
-                                    logger.info(f"[⏳] Legacy plan expired for {config['phone']}. Skipping.")
-                                    # we still allow DB premium via vouchers regardless of legacy expiry
-                            except Exception:
-                                pass
-                        asyncio.create_task(run_user_bot(config))
+                    await user_loop(u)
                 except Exception as e:
-                    logger.error(f"Error loading user config {file}: {e}")
-        await asyncio.sleep(60)
+                    log.error("loop error u%s: %s", u, e)
+
+        tasks = [asyncio.create_task(run_one(u)) for u in uids]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(TICK_INTERVAL)
 
 
 async def main():
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    os.makedirs(USERS_DIR, exist_ok=True)
-    if not os.path.exists(AUTONIGHT_PATH):
-        _save_autonight(AUTONIGHT_CFG)
-    await user_loader()
+    try:
+        await main_loop()
+    except KeyboardInterrupt:
+        log.info("worker stopped by KeyboardInterrupt")
+        # graceful shutdown of clients
+        for uid, st in STATE.items():
+            client = st.get("client")
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Shutdown requested. Exiting.")
+    asyncio.run(main())
