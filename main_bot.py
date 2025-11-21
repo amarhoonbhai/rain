@@ -1,4 +1,4 @@
-import os, asyncio, logging
+import os, asyncio, logging, secrets
 from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -17,6 +17,7 @@ from core.db import (
     get_gate_channels_effective, set_setting, get_setting,
     night_enabled, set_night_enabled, set_name_lock,
     is_premium, set_premium,
+    create_voucher,
 )
 
 # =========================
@@ -68,7 +69,7 @@ def _gate_text():
     lines = "\n".join(f"  • {c}" for c in _gate_channels())
     return (
         "✇ Access required\n"
-        "✇ Join these channels then tap <b>I've Joined</b>:\n"
+        "✇ Join these channels then tap I've Joined:\n"
         f"{lines}"
     )
 
@@ -155,24 +156,23 @@ def kb_main(uid: int):
 
 def _cmds_text():
     return (
-        "📜 <b>Self-Commands</b> (send from your <b>logged-in account</b>, not this bot)\n\n"
-        "Basic (free plan):\n"
-        "• <code>.help</code> – show all commands\n"
-        "• <code>.status</code> – show plan, interval, delay & Auto-Night status\n"
-        "• <code>.info</code> – detailed info (name, phone, groups, plan, expiry)\n"
-        "• <code>.addgroup &lt;link/@user&gt;</code> – add target groups/channels\n"
+        "📜 Self-Commands (send from your logged-in account, not this bot)\n\n"
+        "Free plan:\n"
+        "✹ .help ✹ – show all commands\n"
+        "✹ .status ✹ – show plan, interval, delay & Auto-Night\n"
+        "✹ .info ✹ – detailed info (name, phone, groups, plan, expiry)\n"
+        "✹ .addgroup <link/@user> ✹ – add target groups/channels\n"
         "  ▸ you can also reply to a message containing multiple t.me links\n"
-        "• <code>.delgroup &lt;link/@user&gt;</code> – remove a target\n"
-        "• <code>.groups</code> – list all added groups/channels\n"
-        "• <code>.time 30</code> / <code>.time 45</code> / <code>.time 60</code> – set basic interval (minutes)\n"
-        "• <code>.upgrade</code> – get your Telegram ID to request premium\n\n"
-        "Premium extras (after upgrade):\n"
-        "• <code>.time &lt;value&gt;[m|h]</code> – full custom interval "
-        "(e.g. <code>.time 10</code>, <code>.time 90</code>, <code>.time 2h</code>)\n"
-        "• <code>.delay &lt;sec&gt;</code> – custom per-message delay between forwards\n"
-        "• <code>.night</code> / <code>.night on</code> / <code>.night off</code> / "
-        "<code>.night 23:00-07:00</code> – Auto-Night quiet hours\n\n"
-        f"💎 To upgrade, use <code>.upgrade</code> from your own account and send your ID to {PREMIUM_CONTACT}."
+        "✹ .delgroup <link/@user> ✹ – remove a target\n"
+        "✹ .groups ✹ – list all added groups/channels\n"
+        "✹ .time 30 ✹ / ✹ .time 45 ✹ / ✹ .time 60 ✹ – set basic interval (minutes)\n"
+        "✹ .redeem CODE ✹ – activate a premium code\n\n"
+        "Premium extras (after activation):\n"
+        "✹ .time <value>[m|h] ✹ – full custom interval (e.g. 10, 90, 2h)\n"
+        "✹ .delay <sec> ✹ – custom per-message delay between forwards\n"
+        "✹ .night / .night on / .night off / .night 23:00-07:00 ✹ – Auto-Night quiet hours\n\n"
+        "Owner creates codes with /generate and shares them.\n"
+        "User activates with ✹ .redeem SPN-XXXXXX ✹ from their own account."
     )
 
 
@@ -182,10 +182,10 @@ async def home(m, uid: int):
     interval = get_interval(uid)
     plan = "Premium 💎" if is_premium(uid) else "Free ⚪"
     text = (
-        "✇ <b>Spinify Ads Panel</b>\n"
-        "Use <b>@SpinifyLoginBot</b> to add up to 3 accounts.\n"
-        "Then, from your own Telegram account, type <code>.help</code> to see all self-commands\n"
-        "(.addgroup, .groups, .time, .upgrade, etc.).\n\n"
+        "✇ Spinify Ads Panel\n"
+        "Use @SpinifyLoginBot to add up to 3 accounts.\n"
+        "Then, from your own Telegram account, type ✹ .help ✹ to see all self-commands\n"
+        "(.addgroup, .groups, .time, .redeem, etc.).\n\n"
         f"👤 Plan: {plan}\n"
         f"Sessions: {ss} | Groups: {gs}/{groups_cap(uid)} | Interval: {interval}m\n"
         f"Next send: {('—' if ss == 0 or gs == 0 else _format_eta(uid))}\n"
@@ -202,10 +202,11 @@ async def home(m, uid: int):
 
 
 # =========================
-# FSM for owner broadcast
+# FSM for owner broadcast & generate
 # =========================
-class OwnerFSM(StatesGroup):
+class OwnerBroadcastFSM(StatesGroup):
     broadcast = State()
+    gen_uid = State()
 
 
 # =========================
@@ -243,7 +244,7 @@ async def cb_acc(cq: CallbackQuery):
     uid = cq.from_user.id
     rows = sessions_list(uid)
     if not rows:
-        text = "👤 <b>Manage Accounts</b>\nNo sessions. Add via @SpinifyLoginBot."
+        text = "👤 Manage Accounts\nNo sessions. Add via @SpinifyLoginBot."
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -276,7 +277,7 @@ async def cb_acc(cq: CallbackQuery):
     )
     try:
         await cq.message.edit_text(
-            "👤 <b>Manage Accounts</b>\n" + "\n".join(lines), reply_markup=kb
+            "👤 Manage Accounts\n" + "\n".join(lines), reply_markup=kb
         )
     except TelegramBadRequest:
         pass
@@ -304,7 +305,7 @@ async def cb_unlock(cq: CallbackQuery):
     rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")])
     try:
         await cq.message.edit_text(
-            f"🔓 <b>Unlock GC</b>\nJoin the GC to unlock 10 targets.\nCurrent cap: {cap}",
+            f"🔓 Unlock GC\nJoin the GC to unlock 10 targets.\nCurrent cap: {cap}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
     except TelegramBadRequest:
@@ -345,7 +346,7 @@ async def cb_cmds(cq: CallbackQuery):
 @dp.callback_query(F.data == "menu:disc")
 async def cb_disc(cq: CallbackQuery):
     text = (
-        "⚠️ <b>Disclaimer</b>\n"
+        "⚠️ Disclaimer\n"
         "This tool automates message forwarding using your own Telegram account.\n"
         "Use at your own risk. Always follow Telegram TOS and local laws.\n"
         "We are not responsible for bans, blocks, or any misuse."
@@ -367,15 +368,15 @@ async def cb_disc(cq: CallbackQuery):
 async def cb_prem(cq: CallbackQuery):
     plan = "Premium 💎" if is_premium(cq.from_user.id) else "Free ⚪"
     text = (
-        "💎 <b>Premium Plan</b>\n"
+        "💎 Premium Plan\n"
         f"Your current plan: {plan}\n\n"
         "Premium unlocks extra features in the self-commands:\n"
         "  • Any interval value (.time N)\n"
         "  • Custom per-message delay (.delay)\n"
         "  • Auto-Night scheduling (.night)\n"
         "  • Higher group caps (more targets)\n\n"
-        f"To upgrade, contact {PREMIUM_CONTACT} on Telegram and share your user ID "
-        "(you can see it via <code>.upgrade</code> in your own account)."
+        f"To upgrade, contact {PREMIUM_CONTACT} on Telegram and ask for a code.\n"
+        "You will then activate it with ✹ .redeem CODE ✹ from your own account."
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -398,7 +399,7 @@ async def fstats(msg: Message):
     eta = "—" if ss == 0 or gs == 0 else _format_eta(uid)
     plan = "Premium 💎" if is_premium(uid) else "Free ⚪"
     await msg.answer(
-        "📟 <b>Forward Stats</b>\n"
+        "📟 Forward Stats\n"
         f"Plan: {plan}\n"
         f"▶ Worker: {'RUNNING' if ss>0 else 'IDLE'}\n"
         f"Interval: {interval} min\n"
@@ -429,7 +430,7 @@ async def owner_stats(cq: CallbackQuery):
     active = sessions_count()
     sent = get_total_sent_ok()
     await cq.message.edit_text(
-        f"📊 <b>Global Stats</b>\n"
+        f"📊 Global Stats\n"
         f"Users: {total}\n"
         f"Active sessions: {active}\n"
         f"Total forwarded: {sent}",
@@ -449,8 +450,8 @@ async def owner_top(cq: CallbackQuery):
     if not rows:
         text = "🏆 No data."
     else:
-        text = "🏆 <b>Top Users</b>\n" + "\n".join(
-            f"{i+1}. <code>{r['user_id']}</code> — {r['sent_ok']}"
+        text = "🏆 Top Users\n" + "\n".join(
+            f"{i+1}. {r['user_id']} — {r['sent_ok']}"
             for i, r in enumerate(rows)
         )
     await cq.message.edit_text(
@@ -461,10 +462,6 @@ async def owner_top(cq: CallbackQuery):
             ]
         ),
     )
-
-
-class OwnerBroadcastFSM(StatesGroup):
-    broadcast = State()
 
 
 @dp.callback_query(F.data == "owner:bcast")
@@ -506,17 +503,18 @@ async def do_bcast(msg: Message, state: FSMContext):
 @dp.callback_query(F.data == "owner:prem")
 async def owner_prem_menu(cq: CallbackQuery):
     """
-    Just show instructions for /upgrade and /downgrade.
+    Info for owner about premium tools.
     """
     if not is_owner(cq.from_user.id):
         return
     text = (
-        "⚙️ <b>Owner Premium Controls</b>\n\n"
-        "Use commands in this bot:\n"
-        "  • <code>/upgrade &lt;user_id&gt;</code> – enable premium for a user\n"
-        "  • <code>/downgrade &lt;user_id&gt;</code> – disable premium for a user\n\n"
-        "Premium flag is stored in DB and used by the forwarder.\n"
-        "You can also use name-lock via internal tools if needed."
+        "⚙️ Owner Premium Controls\n\n"
+        "You can manage premium in three ways:\n"
+        "  • /upgrade user_id  – directly mark user as premium (DB flag)\n"
+        "  • /downgrade user_id – remove premium flag\n"
+        "  • /generate         – create redeem codes (SPN-XXXXXX)\n\n"
+        "Users then activate codes with ✹ .redeem CODE ✹ from their own account.\n"
+        "Forwarder reads the DB premium flag and unlocks features."
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -539,18 +537,17 @@ async def owner_upgrade(msg: Message):
         return
     parts = msg.text.split()
     if len(parts) != 2:
-        await msg.answer("Usage: <code>/upgrade &lt;user_id&gt;</code>")
+        await msg.answer("Usage: /upgrade user_id")
         return
     try:
         target = int(parts[1])
     except Exception:
-        await msg.answer("❌ <code>user_id</code> must be integer.")
+        await msg.answer("❌ user_id must be integer.")
         return
     set_premium(target, True)
     set_setting(f"groups_cap:{target}", 50)
     await msg.answer(
-        f"💎 Premium enabled for <code>{target}</code> (cap=50).\n"
-        "Name-lock can be managed separately if you want."
+        f"💎 Premium enabled for {target} (cap=50)."
     )
 
 
@@ -564,17 +561,64 @@ async def owner_downgrade(msg: Message):
         return
     parts = msg.text.split()
     if len(parts) != 2:
-        await msg.answer("Usage: <code>/downgrade &lt;user_id&gt;</code>")
+        await msg.answer("Usage: /downgrade user_id")
         return
     try:
         target = int(parts[1])
     except Exception:
-        await msg.answer("❌ <code>user_id</code> must be integer.")
+        await msg.answer("❌ user_id must be integer.")
         return
     set_premium(target, False)
     set_setting(f"groups_cap:{target}", 5)
     await msg.answer(
-        f"🧹 Premium disabled for <code>{target}</code> (cap=5)."
+        f"🧹 Premium disabled for {target} (cap=5)."
+    )
+
+
+@dp.message(Command("generate"))
+async def owner_generate(msg: Message, state: FSMContext):
+    """
+    /generate — OWNER ONLY
+    Step 1: ask for user_id (or 0 for any user).
+    """
+    if not is_owner(msg.from_user.id):
+        return
+    await state.set_state(OwnerBroadcastFSM.gen_uid)
+    await msg.answer(
+        "💎 Generate Premium Code\n"
+        "Send user_id to lock this code to that user,\n"
+        "or send 0 to make it usable by ANY user."
+    )
+
+
+@dp.message(OwnerBroadcastFSM.gen_uid)
+async def owner_generate_uid(msg: Message, state: FSMContext):
+    if not is_owner(msg.from_user.id):
+        await state.clear()
+        return
+    try:
+        target = int(msg.text.strip())
+    except Exception:
+        await msg.answer("❌ user_id must be integer (or 0).")
+        return
+
+    user_id = None if target == 0 else target
+
+    raw = secrets.token_hex(3).upper()   # 6 hex chars
+    code = f"SPN-{raw}"
+
+    create_voucher(code, user_id=user_id)
+    await state.clear()
+
+    lock_text = "any user" if user_id is None else f"user_id {user_id}"
+
+    await msg.answer(
+        "🔐 Premium Code Created\n"
+        f"• Code: {code}\n"
+        f"• Locked to: {lock_text}\n\n"
+        "Share this with the user.\n"
+        "They activate it from their own account using:\n"
+        f"✹ .redeem {code} ✹"
     )
 
 
