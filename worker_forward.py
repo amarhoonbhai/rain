@@ -1,10 +1,11 @@
 # worker_forward.py
-# Spinify Ads – Telethon Forwarder
-# - Reads latest ad from Saved Messages ("me")
-# - Supports self-commands from your login account:
+# Spinify Ads – Telethon Forwarder (Stable A-Version)
+# - Uses Saved Messages as ad source
+# - Supports self-commands:
 #     .help, .status, .time 30/45/60, .gc, .addgc, .cleargc, .adreset
-# - Forwards only NON-command texts to all target groups
-# - 100 seconds delay between each group
+# - Never forwards commands
+# - Fixes duplicate replies, session loops, and Telethon start issues
+# - 100-second delay between each group
 
 import asyncio
 import logging
@@ -12,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List
 
 from telethon import TelegramClient, events, errors
+from telethon.sessions import StringSession
 
 from core.db import (
     init_db,
@@ -32,15 +34,16 @@ from core.db import (
 log = logging.getLogger("forwarder")
 
 
-# =========================
+# ==========================================
 # Helpers
-# =========================
+# ==========================================
 
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
 
 def is_cmd(text: str | None) -> bool:
+    """Return True if message is a command (.something)"""
     if not text:
         return False
     return text.strip().startswith(".")
@@ -50,28 +53,25 @@ def get_saved_ad(uid: int) -> str | None:
     return get_setting(f"ad_text:{uid}", None)
 
 
-def set_saved_ad(uid: int, text: str) -> None:
+def set_saved_ad(uid: int, text: str):
     set_setting(f"ad_text:{uid}", text)
 
 
-# =========================
-# Command handler helpers
-# =========================
+# ==========================================
+# Self-Command Handlers
+# ==========================================
 
 async def cmd_help(event, uid: int):
     msg = (
-        "✹ Spinify Ads – Self Commands\n\n"
-        "Use these from your <b>logged-in account</b> (not bot):\n\n"
-        "Basic:\n"
-        "• .help – show this help\n"
-        "• .status – show timer, next send, groups\n"
-        "• .time 30 / .time 45 / .time 60 – set interval (minutes)\n"
-        "• .gc – list groups\n"
-        "• .addgc <links/@user> – add groups (one or multiple)\n"
-        "• .cleargc – clear all target groups\n"
-        "• .adreset – re-use latest Saved Message as ad\n\n"
-        "✹ Put your ad text in Saved Messages.\n"
-        "✹ Only latest non-command message is used for forwarding.\n"
+        "✹ <b>Spinify Ads – Commands</b>\n\n"
+        "Use from your <b>logged-in account:</b>\n\n"
+        "• .help — show this help\n"
+        "• .status — show timer, groups, next send\n"
+        "• .time 30|45|60 — set interval\n"
+        "• .gc — list groups\n"
+        "• .addgc LINK — add group(s)\n"
+        "• .cleargc — clear all groups\n"
+        "• .adreset — set last Saved Message as ad\n"
     )
     await event.reply(msg, parse_mode="html")
 
@@ -80,46 +80,41 @@ async def cmd_status(event, uid: int):
     interval = get_interval(uid)
     if interval not in (30, 45, 60):
         interval = 30
+
     last = get_last_sent_at(uid)
     now = now_ts()
+
     if last is None:
         eta = f"in ~{interval}m (first cycle)"
     else:
         left = interval * 60 - (now - last)
-        if left <= 5:
+        if left <= 0:
             eta = "very soon"
         else:
-            m, s = divmod(max(0, left), 60)
+            m, s = divmod(left, 60)
             eta = f"in ~{m}m {s}s"
 
-    groups = list_groups(uid)
+    g = list_groups(uid)
     ad = get_saved_ad(uid)
-    ad_status = "set ✅" if ad else "not set ❌"
 
     msg = (
-        "📟 Spinify Status\n\n"
-        f"• Interval: {interval} min\n"
-        f"• Groups: {len(groups)}/{groups_cap(uid)}\n"
+        "📟 <b>Spinify Status</b>\n\n"
+        f"• Interval: {interval}m\n"
+        f"• Groups: {len(g)}/{groups_cap(uid)}\n"
         f"• Next send: {eta}\n"
-        f"• Saved Ad: {ad_status}\n"
+        f"• Ad saved: {'yes ✅' if ad else 'no ❌'}\n"
     )
-    await event.reply(msg)
+    await event.reply(msg, parse_mode="html")
 
 
 async def cmd_time(event, uid: int, text: str):
-    parts = text.split()
-    if len(parts) < 2:
-        await event.reply("Usage: `.time 30` or `.time 45` or `.time 60`")
-        return
     try:
-        val = int(parts[1])
-    except Exception:
-        await event.reply("Time must be 30, 45 or 60 (minutes).")
-        return
+        val = int(text.split()[1])
+    except:
+        return await event.reply("Usage: `.time 30|45|60`")
 
     if val not in (30, 45, 60):
-        await event.reply("Only 30 / 45 / 60 minutes are allowed.")
-        return
+        return await event.reply("Only 30 / 45 / 60 allowed.")
 
     set_interval(uid, val)
     await event.reply(f"✅ Interval set to {val} minutes.")
@@ -128,89 +123,82 @@ async def cmd_time(event, uid: int, text: str):
 async def cmd_gc(event, uid: int):
     groups = list_groups(uid)
     if not groups:
-        await event.reply("No groups added yet. Use `.addgc` with links/usernames.")
-        return
-    lines = [f"{i+1}. {g}" for i, g in enumerate(groups)]
-    await event.reply("🎯 Target Groups:\n" + "\n".join(lines))
+        return await event.reply("No groups added yet.")
+
+    msg = "🎯 <b>Your Groups</b>\n" + "\n".join(
+        f"{i+1}. {g}" for i, g in enumerate(groups)
+    )
+    await event.reply(msg, parse_mode="html")
 
 
 async def cmd_addgc(event, uid: int, text: str):
-    # Accept from message text AND reply message text
     import re
     pattern = r"(https?://t\.me/\S+|t\.me/\S+|@\w+|-100\d+)"
-    all_text = text or ""
+
+    all_text = text
     if event.is_reply:
         rep = await event.get_reply_message()
         if rep and rep.raw_text:
             all_text += "\n" + rep.raw_text
 
-    links = re.findall(pattern, all_text)
-    if not links:
-        await event.reply(
-            "No valid targets found.\n"
-            "Example: `.addgc https://t.me/yourgroup` or `.addgc @yourgroup`"
-        )
-        return
+    found = re.findall(pattern, all_text)
+    if not found:
+        return await event.reply("❌ No valid group links found.")
 
     added = 0
     skipped = 0
-    for l in links:
-        ok = add_group(uid, l)
-        if ok:
-            added += 1
-        else:
-            skipped += 1
+    for g in found:
+        ok = add_group(uid, g)
+        added += 1 if ok else 0
+        skipped += 0 if ok else 1
 
-    await event.reply(f"✅ Added: {added} | Skipped (dupe/cap): {skipped}")
+    await event.reply(f"Added: {added} | Skipped: {skipped}")
 
 
 async def cmd_cleargc(event, uid: int):
     clear_groups(uid)
-    await event.reply("🧹 All groups cleared.")
+    await event.reply("🧹 Cleared all groups.")
 
 
 async def cmd_adreset(event, uid: int, client):
-    # Re-read latest suitable Saved Message
-    msgs = await client.get_messages("me", limit=50)
+    msgs = await client.get_messages("me", limit=30)
     for m in msgs:
-        txt = m.message or ""
-        if not txt:
-            continue
-        if is_cmd(txt):
-            continue
-        set_saved_ad(uid, txt)
-        await event.reply("✅ Ad text reset from latest Saved Message.")
-        return
-    await event.reply("No valid ad text found in Saved Messages.")
+        txt = m.raw_text or ""
+        if txt and not is_cmd(txt):
+            set_saved_ad(uid, txt)
+            return await event.reply("✅ Ad updated from Saved Messages.")
+
+    await event.reply("❌ No valid ad found in Saved Messages.")
 
 
 async def handle_command(event, uid: int, client):
-    text = (event.raw_text or "").strip()
-    low = text.lower()
+    text = (event.raw_text or "").strip().lower()
 
-    if low.startswith(".help"):
-        await cmd_help(event, uid)
-    elif low.startswith(".status"):
-        await cmd_status(event, uid)
-    elif low.startswith(".time"):
-        await cmd_time(event, uid, text)
-    elif low.startswith(".gc"):
-        await cmd_gc(event, uid)
-    elif low.startswith(".addgc"):
-        await cmd_addgc(event, uid, text)
-    elif low.startswith(".cleargc"):
-        await cmd_cleargc(event, uid)
-    elif low.startswith(".adreset"):
-        await cmd_adreset(event, uid, client)
-    else:
-        await event.reply("Unknown command. Type `.help` for list.")
+    if text.startswith(".help"):
+        return await cmd_help(event, uid)
+    if text.startswith(".status"):
+        return await cmd_status(event, uid)
+    if text.startswith(".time"):
+        return await cmd_time(event, uid, event.raw_text)
+    if text.startswith(".gc"):
+        return await cmd_gc(event, uid)
+    if text.startswith(".addgc"):
+        return await cmd_addgc(event, uid, event.raw_text)
+    if text.startswith(".cleargc"):
+        return await cmd_cleargc(event, uid)
+    if text.startswith(".adreset"):
+        return await cmd_adreset(event, uid, client)
+
+    await event.reply("Unknown command. Use `.help`.")
 
 
-# =========================
-# Forward loop
-# =========================
+# ==========================================
+# Forwarding Loop
+# ==========================================
 
 async def forward_loop(client: TelegramClient, uid: int):
+    """Responsible for sending ads at interval."""
+
     while True:
         interval = get_interval(uid)
         if interval not in (30, 45, 60):
@@ -219,17 +207,12 @@ async def forward_loop(client: TelegramClient, uid: int):
         last = get_last_sent_at(uid)
         now = now_ts()
 
-        if last is not None and (now - last) < interval * 60:
+        if last and (now - last) < interval * 60:
             await asyncio.sleep(5)
             continue
 
         ad = get_saved_ad(uid)
-        if not ad:
-            await asyncio.sleep(5)
-            continue
-
-        if is_cmd(ad):
-            # safety: never forward commands
+        if not ad or is_cmd(ad):
             await asyncio.sleep(5)
             continue
 
@@ -241,75 +224,69 @@ async def forward_loop(client: TelegramClient, uid: int):
         for t in targets:
             try:
                 await client.send_message(t, ad)
-                log.info(f"[user {uid}] sent ad to {t}")
+                log.info(f"[UID {uid}] → Sent to {t}")
             except errors.FloodWaitError as e:
-                log.warning(f"[user {uid}] FloodWait {e.seconds}s")
                 await asyncio.sleep(e.seconds)
             except Exception as e:
-                log.error(f"[user {uid}] send error to {t}: {e}")
-            await asyncio.sleep(100)  # REQUIRED 100s DELAY
+                log.error(f"[UID {uid}] Send error → {t}: {e}")
+
+            await asyncio.sleep(100)  
 
         set_last_sent_at(uid, now_ts())
 
 
-# =========================
-# Per-user Telethon client
-# =========================
+# ==========================================
+# Client Worker
+# ==========================================
 
 async def client_worker(uid: int, sess: Dict[str, Any]):
     api_id = int(sess["api_id"])
     api_hash = sess["api_hash"]
-    session_string = sess["session_string"]
+    string_sess = sess["session_string"]
 
     client = TelegramClient(
-        session=f"user-{uid}-slot-{sess['slot']}",
+        session=StringSession(string_sess),
         api_id=api_id,
         api_hash=api_hash,
         system_version="Android",
     )
 
-    # use string session
-    client = client.start(string_session=session_string)
+    await client.start()
+    log.info(f"Telethon started for user {uid}, slot {sess['slot']}")
 
-    log.info(f"Telethon client started for user {uid}, slot {sess['slot']}")
-
-    # 1) listen Saved Messages for ad content
     @client.on(events.NewMessage(chats="me"))
-    async def saved_handler(ev):
+    async def saved(ev):
         txt = ev.raw_text or ""
-        if not txt or is_cmd(txt):
-            return
-        set_saved_ad(uid, txt)
-        log.info(f"[user {uid}] updated ad from Saved Messages")
+        if txt and not is_cmd(txt):
+            set_saved_ad(uid, txt)
+            log.info(f"[{uid}] Updated ad from Saved Messages")
 
-    # 2) listen outgoing self commands (any chat)
     @client.on(events.NewMessage(outgoing=True))
-    async def cmd_handler(ev):
+    async def cmds(ev):
         txt = ev.raw_text or ""
-        if not is_cmd(txt):
-            return
-        await handle_command(ev, uid, client)
+        if is_cmd(txt):
+            await handle_command(ev, uid, client)
 
     try:
         await forward_loop(client, uid)
     finally:
         await client.disconnect()
-        log.info(f"Telethon client stopped for user {uid}, slot {sess['slot']}")
+        log.info(f"Telethon stopped for user {uid}, slot {sess['slot']}")
 
 
-# =========================
+# ==========================================
 # Entry for run_all.py
-# =========================
+# ==========================================
 
 async def start():
     init_db()
     rows = get_conn().execute("SELECT DISTINCT user_id FROM sessions").fetchall()
     if not rows:
-        log.info("No sessions found in DB.")
+        log.info("Forwarder: no sessions in DB.")
         await asyncio.sleep(10)
         return
 
-    tasks: List[asyncio.Task] = []
+    tasks = []
     for r in rows:
         uid = r["user_id"]
         for sess in sessions_list(uid):
@@ -317,5 +294,3 @@ async def start():
 
     if tasks:
         await asyncio.gather(*tasks)
-    else:
-        log.info("No active sessions for forwarder.")
