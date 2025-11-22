@@ -86,7 +86,7 @@ def users_count() -> int:
 
 
 # ====================================
-# SESSIONS (Login bot / Worker)
+# SESSIONS
 # ====================================
 def sessions_list(user_id: int) -> List[Dict[str, Any]]:
     return list(
@@ -104,7 +104,6 @@ def sessions_delete(user_id: int, slot: int) -> int:
 
 
 def _session_slots_cap(user_id: int) -> int:
-    """Simple fixed 3 slots per user (for Login Bot)"""
     try:
         return max(1, int(os.getenv("SESSION_SLOTS_CAP", "3")))
     except Exception:
@@ -121,7 +120,6 @@ def first_free_slot(user_id: int, cap: Optional[int] = None) -> Optional[int]:
         if s not in used:
             return s
 
-    # no free slot → reuse oldest
     doc = db().sessions.find_one(
         {"user_id": int(user_id)}, sort=[("updated_at", 1)]
     )
@@ -131,7 +129,6 @@ def first_free_slot(user_id: int, cap: Optional[int] = None) -> Optional[int]:
 def sessions_upsert_slot(
     user_id: int, slot: int, api_id: int, api_hash: str, session_string: str
 ):
-    """Store login credentials"""
     db().sessions.update_one(
         {"user_id": int(user_id), "slot": int(slot)},
         {
@@ -146,7 +143,7 @@ def sessions_upsert_slot(
     )
 
 
-# Login Bot compatibility
+# compatibility
 def store_api_credentials(user_id: int, slot: int, api_id: int, api_hash: str, ss: str):
     sessions_upsert_slot(user_id, slot, api_id, api_hash, ss)
 
@@ -156,25 +153,28 @@ def delete_api_credentials(user_id: int, slot: int):
 
 
 # ====================================
+# REQUIRED FOR ENFORCER
+# ====================================
+def users_with_sessions() -> List[int]:
+    return [
+        r["_id"]
+        for r in db().sessions.aggregate([{"$group": {"_id": "$user_id"}}])
+    ]
+
+
+# ====================================
 # GROUPS
 # ====================================
 def groups_cap(user_id: Optional[int] = None) -> int:
-    """
-    NEW LOGIC:
-    - default = 5 groups
-    - if manually unlocked → 20
-    """
     if user_id is None:
         return 5
 
     uid = int(user_id)
 
-    # manual unlock
     v = get_setting(f"groups_cap:{uid}", None)
     if v is not None:
         return _as_int(v, 5)
 
-    # legacy unlock flag
     if get_setting(f"gc_unlock:{uid}", 0) not in (0, "0", None, False):
         return 20
 
@@ -191,16 +191,12 @@ def list_groups(user_id: int) -> List[str]:
 def add_group(user_id: int, target: str) -> int:
     if not target:
         return 0
-
     target = target.strip()
     items = list_groups(user_id)
-
     if target in items:
         return 0
-
     if len(items) >= groups_cap(user_id):
         return 0
-
     items.append(target)
     db().groups.update_one(
         {"user_id": int(user_id)},
@@ -216,6 +212,19 @@ def clear_groups(user_id: int):
         {"$set": {"targets": [], "updated_at": _now()}},
         upsert=True,
     )
+
+
+# REQUIRED — you forgot this in your version
+def remove_group(user_id: int, g: str):
+    items = list_groups(user_id)
+    if g in items:
+        items.remove(g)
+        db().groups.update_one(
+            {"user_id": int(user_id)},
+            {"$set": {"targets": items, "updated_at": _now()}},
+        )
+        return 1
+    return 0
 
 
 # ====================================
