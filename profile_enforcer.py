@@ -12,7 +12,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("enforcer")
 
 BIO_DEFAULT = "#1 Free Ads Bot — Managed By @PhiloBots"
-NAME_SUFFIX = " Hosted By — @SpinifyAdsBot"
+NAME_SUFFIX = "Cast By — @SpinifyAdsBot"
 
 SLEEP_SCAN = 300       # full scan interval
 MIN_GAP_PER_USER = 600 # minimum gap per user (seconds)
