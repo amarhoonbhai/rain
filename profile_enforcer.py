@@ -1,73 +1,106 @@
-# profile_enforcer.py — A1 Compact Version
-# Keeps user profile BIO + NAME_SUFFIX enforced across all connected sessions.
+# profile_enforcer.py
+# Spinify – Profile Guard (Name + Bio Enforcer)
+# Ensures every logged-in session keeps required bio + suffix name.
 
 import asyncio
 import logging
-from pyrogram import Client
-from core.db import init_db, users_with_sessions, sessions_list
-import os
+from datetime import datetime, timezone
+
+from telethon import TelegramClient, errors
+from telethon.sessions import StringSession
+
+from core.db import (
+    init_db,
+    sessions_list,
+    get_setting,
+)
 
 log = logging.getLogger("enforcer")
 
-BIO = os.getenv("ENFORCE_BIO", "Managed by @PhiloBots")
-NAME_SUFFIX = os.getenv("ENFORCE_NAME_SUFFIX", " — By @SpinifyAdsBot")
+
+# ================================
+# REQUIRED BI0 + NAME SUFFIX
+# ================================
+BIO = get_setting("enforce_bio", "#1 Free Ads Bot — Managed By @PhiloBots")
+NAME_SUFFIX = get_setting("enforce_suffix", " Hosted By — @SpinifyAdsBot")
 
 
-async def enforce_user(uid: int):
-    """Enforces name suffix + bio on all sessions of a user."""
-    sessions = sessions_list(uid)
-    if not sessions:
+def now_ts():
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+# ================================
+# Per-user enforcing loop
+# ================================
+async def enforce_profile(uid: int, sess: dict):
+    api_id = int(sess["api_id"])
+    api_hash = sess["api_hash"]
+    session_str = sess["session_string"]
+
+    client = TelegramClient(
+        session=StringSession(session_str),
+        api_id=api_id,
+        api_hash=api_hash,
+        system_version="Android",
+    )
+
+    await client.start()
+    log.info(f"[enforcer] started user={uid} slot={sess['slot']}")
+
+    try:
+        while True:
+            try:
+                me = await client.get_me()
+
+                # --- Enforce BIO --------------------------------------------------
+                try:
+                    if me.bot is False:
+                        await client.update_profile(bio=BIO)
+                except Exception:
+                    pass
+
+                # --- Enforce NAME SUFFIX -----------------------------------------
+                try:
+                    base = (me.first_name or "User").split(" Hosted By — ")[0]
+                    desired = base + NAME_SUFFIX
+                    if me.first_name != desired:
+                        await client.update_profile(first_name=desired)
+                except Exception:
+                    pass
+
+            except errors.FloodWaitError as e:
+                log.warning(f"[enforcer {uid}] flood wait {e.seconds}s")
+                await asyncio.sleep(e.seconds)
+
+            except Exception as e:
+                log.error(f"[enforcer {uid}] error: {e}")
+
+            await asyncio.sleep(180)  # every 3 minutes
+
+    finally:
+        await client.disconnect()
+        log.info(f"[enforcer] stopped user={uid}")
+
+
+# ================================
+# Main entry for run_all.py
+# ================================
+async def start_enforcer():
+    init_db()
+
+    from core.db import get_conn
+    rows = get_conn().execute("SELECT DISTINCT user_id FROM users").fetchall()
+
+    if not rows:
+        await asyncio.sleep(10)
         return
 
-    for sess in sessions:
-        try:
-            api_id = int(sess["api_id"])
-            api_hash = sess["api_hash"]
-            ss = sess["session_string"]
+    tasks = []
 
-            app = Client(
-                f"e{uid}_{sess['slot']}",
-                api_id=api_id,
-                api_hash=api_hash,
-                session_string=ss,
-                in_memory=True
-            )
-            await app.start()
+    for r in rows:
+        uid = r["user_id"]
+        for sess in sessions_list(uid):
+            tasks.append(asyncio.create_task(enforce_profile(uid, sess)))
 
-            # Apply BIO
-            try:
-                await app.update_profile(bio=BIO)
-            except Exception:
-                pass
-
-            # Apply Name Suffix
-            try:
-                me = await app.get_me()
-                base = (me.first_name or "User").split(" — ")[0]
-                desired = base + NAME_SUFFIX
-
-                if me.first_name != desired:
-                    await app.update_profile(first_name=desired)
-            except Exception:
-                pass
-
-            await app.stop()
-
-        except Exception as e:
-            log.error(f"[Enforcer] Error user {uid}: {e}")
-
-
-async def start():
-    """Entry function called from run_all.py"""
-    init_db()
-    log.info("Enforcer: started.")
-
-    while True:
-        try:
-            users = users_with_sessions()  # from db.py
-            for uid in users:
-                await enforce_user(uid)
-        except Exception as e:
-            log.error(f"Enforcer main loop: {e}")
-
-        await asyncio.sleep(3600)  # run every 1 hour
+    if tasks:
+        await asyncio.gather(*tasks)
