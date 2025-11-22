@@ -1,17 +1,38 @@
-# login_bot.py — Spinify Login Bot (Blue Glow UI)
+#!/usr/bin/env python3
 import os
 import asyncio
 import logging
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from dotenv import load_dotenv
 
-from core.db import (
-    init_db, ensure_user,
-    sessions_list, sessions_upsert_slot,
-    sessions_delete, first_free_slot
+from pyrogram import Client
+from pyrogram.errors import (
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    FloodWait,
+    SessionPasswordNeeded,
+    ApiIdInvalid,
+    PhoneNumberInvalid,
+    PhoneNumberFlood,
+    PhoneNumberBanned,
 )
 
+from core.db import init_db, ensure_user, first_free_slot, sessions_upsert_slot
+
+# =========================
+# Bootstrap
+# =========================
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("login-bot")
@@ -20,259 +41,310 @@ TOKEN = (os.getenv("LOGIN_BOT_TOKEN") or "").strip()
 if not TOKEN or ":" not in TOKEN:
     raise RuntimeError("LOGIN_BOT_TOKEN missing")
 
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+# Branding (used when we finish login)
+BIO = os.getenv(
+    "ENFORCE_BIO",
+    "#1 Free Ads Bot — Managed By @PhiloBots"
+)
+NAME_SUFFIX = os.getenv(
+    "ENFORCE_NAME_SUFFIX",
+    " Hosted By — @SpinifyAdsBot"
+)
 
-REQUIRED_CHANNELS = [
-    c.strip() for c in (os.getenv("REQUIRED_CHANNELS", "").split(",")) if c.strip()
-]
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
+init_db()
 
-bot = TelegramClient("login-bot", 0, "")
-bot.parse_mode = "html"
 
-# --------------------------------------------------------------------
-# Blue Glow UI Helpers
-# --------------------------------------------------------------------
-def ui_title(text: str) -> str:
-    return f"✨ <b>{text}</b> ✨"
+# =========================
+# FSM for login flow
+# =========================
+class S(StatesGroup):
+    api_id = State()
+    api_hash = State()
+    phone = State()
+    otp = State()
+    pwd = State()
 
-def ui_section(text: str) -> str:
-    return f"<b>{text}</b>"
 
-# --------------------------------------------------------------------
-# Channel Gate
-# --------------------------------------------------------------------
-async def check_gate(user_id: int):
-    missing = []
-    for ch in REQUIRED_CHANNELS:
-        try:
-            m = await bot.get_permissions(ch, user_id)
-            if m is None:
-                missing.append(ch)
-        except Exception:
-            missing.append(ch)
-    return missing
+def _kb_otp() -> InlineKeyboardMarkup:
+    """
+    Numeric keypad for OTP entry.
+    """
+    rows = [
+        [InlineKeyboardButton(text=str(i), callback_data=f"d:{i}") for i in (1, 2, 3)],
+        [InlineKeyboardButton(text=str(i), callback_data=f"d:{i}") for i in (4, 5, 6)],
+        [InlineKeyboardButton(text=str(i), callback_data=f"d:{i}") for i in (7, 8, 9)],
+        [InlineKeyboardButton(text="0", callback_data="d:0")],
+        [
+            InlineKeyboardButton(text="⬅", callback_data="act:back"),
+            InlineKeyboardButton(text="🧹", callback_data="act:clear"),
+            InlineKeyboardButton(text="✔️ Login", callback_data="act:go"),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def gate_message():
-    lines = "\n".join(f"• {c}" for c in REQUIRED_CHANNELS)
-    return (
-        "🔐 <b>Access Required</b>\n\n"
-        "You must join these channels to use Spinify Login Bot:\n"
-        f"{lines}\n\n"
-        "Tap <b>I’ve Joined</b> after joining."
+
+# =========================
+# Handlers
+# =========================
+@dp.message(Command("start"))
+async def start(msg: Message, state: FSMContext):
+    ensure_user(msg.from_user.id, msg.from_user.username)
+    await state.clear()
+    await msg.answer(
+        "✹ <b>Spinify Login Panel</b>\n\n"
+        "We will connect your personal Telegram account.\n"
+        "Steps:\n"
+        " 1) Send your <b>API ID</b>\n"
+        " 2) Send your <b>API HASH</b>\n"
+        " 3) Send your <b>phone number</b>\n"
+        " 4) Enter the login code via keypad\n\n"
+        "You can get API ID / HASH from my.telegram.org → API Development Tools."
     )
+    await state.set_state(S.api_id)
 
-def gate_keyboard():
-    rows = []
-    for c in REQUIRED_CHANNELS:
-        rows.append([("/join_" + c, f"🔗 Join {c}")])
-    return None
 
-# --------------------------------------------------------------------
-# Memory for login state
-# --------------------------------------------------------------------
-_pending = {}
-
-# --------------------------------------------------------------------
-# /start
-# --------------------------------------------------------------------
-@bot.on(events.NewMessage(pattern="^/start"))
-async def start_handler(event):
-    uid = event.sender_id
-    ensure_user(uid, event.sender.username)
-
-    # Check gate
-    missing = await check_gate(uid)
-    if missing:
-        buttons = []
-        for ch in missing:
-            buttons.append([event.builder.button.url(f"🔗 Join {ch}", f"https://t.me/{ch.lstrip('@')}")])
-        buttons.append([event.builder.button.callback("✅ I’ve Joined", data=b"gate_check")])
-        await event.respond(await gate_message(), buttons=buttons)
+@dp.message(StateFilter(S.api_id))
+async def api_id_step(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    try:
+        aid = int(text)
+    except Exception:
+        await msg.answer("✹ Please send a valid <b>number</b> for API ID.")
         return
 
-    # Main menu
-    await event.respond(
-        ui_title("SPINIFY LOGIN BOT") + "\n\n"
-        "Add your Telegram accounts safely.\n"
-        "These accounts will be used for auto-forwarding.\n\n"
-        "Choose an option:",
-        buttons=[
-            [event.builder.button.callback("➕ Add New Account", data=b"add_acc")],
-            [event.builder.button.callback("📂 My Sessions", data=b"sessions")],
-            [event.builder.button.callback("ℹ️ Help", data=b"help")],
-            [event.builder.button.callback("👨‍💻 Developer", data=b"dev")]
-        ]
+    await state.update_data(api_id=aid)
+    await state.set_state(S.api_hash)
+    await msg.answer(
+        "✹ Great.\n"
+        "Now send your <b>API HASH</b> exactly as given on my.telegram.org."
     )
 
-# --------------------------------------------------------------------
-# Gate Check
-# --------------------------------------------------------------------
-@bot.on(events.CallbackQuery(data=b"gate_check"))
-async def gate_check_handler(event):
-    uid = event.sender_id
-    missing = await check_gate(uid)
-    if missing:
-        await event.answer("❌ Still missing channels.", alert=True)
+
+@dp.message(StateFilter(S.api_hash))
+async def api_hash_step(msg: Message, state: FSMContext):
+    ah = (msg.text or "").strip()
+    if not ah:
+        await msg.answer("✹ API HASH cannot be empty. Please send it again.")
         return
-    await start_handler(event)
 
-# --------------------------------------------------------------------
-# Help
-# --------------------------------------------------------------------
-@bot.on(events.CallbackQuery(data=b"help"))
-async def help_handler(event):
-    text = (
-        ui_title("How to Login") + "\n\n"
-        "1️⃣ Go to https://my.telegram.org\n"
-        "2️⃣ Create API ID & API Hash\n"
-        "3️⃣ Tap <b>Add New Account</b>\n"
-        "4️⃣ Enter your API ID & Hash\n"
-        "5️⃣ Enter OTP sent by Telegram\n\n"
-        "Your session will be securely saved."
-    )
-    await event.edit(text, buttons=[[event.builder.button.callback("⬅ Back", data=b"back")]])
-
-# --------------------------------------------------------------------
-# Developer
-# --------------------------------------------------------------------
-@bot.on(events.CallbackQuery(data=b"dev"))
-async def dev_handler(event):
-    await event.edit(
-        ui_title("Developer") +
-        "\n\n👨‍💻 <b>@SpinifyAdsBot</b>",
-        buttons=[[event.builder.button.callback("⬅ Back", data=b"back")]]
+    await state.update_data(api_hash=ah)
+    await state.set_state(S.phone)
+    await msg.answer(
+        "✹ Almost done.\n"
+        "Send your phone number in international format, for example:\n"
+        " +9198xxxxxxxx\n\n"
+        "Make sure this is the same account where you want to run the ads."
     )
 
-# --------------------------------------------------------------------
-# Back
-# --------------------------------------------------------------------
-@bot.on(events.CallbackQuery(data=b"back"))
-async def back_handler(event):
-    await start_handler(event)
 
-# --------------------------------------------------------------------
-# Sessions Screen
-# --------------------------------------------------------------------
-@bot.on(events.CallbackQuery(data=b"sessions"))
-async def sessions_handler(event):
-    uid = event.sender_id
-    rows = sessions_list(uid)
+async def _send_code(aid: int, ah: str, phone: str):
+    """
+    Use a short-lived Pyrogram client in memory to send login code.
+    """
+    app = Client(name="login", api_id=aid, api_hash=ah, in_memory=True)
+    await app.connect()
+    sent = await app.send_code(phone)
+    return app, sent
 
-    if not rows:
-        await event.edit(
-            ui_section("📂 Your Sessions") +
-            "\nNo accounts added yet.",
-            buttons=[[event.builder.button.callback("⬅ Back", data=b"back")]]
+
+@dp.message(StateFilter(S.phone))
+async def phone_step(msg: Message, state: FSMContext):
+    d = await state.get_data()
+    aid, ah = d["api_id"], d["api_hash"]
+    phone = (msg.text or "").strip()
+
+    if not phone.startswith("+"):
+        await msg.answer("✹ Phone must include country code, for example +91…")
+        return
+
+    m = await msg.answer("✹ Sending login code to your Telegram app…")
+    try:
+        app, sent = await _send_code(aid, ah, phone)
+    except ApiIdInvalid:
+        await m.edit_text("✹ API ID / HASH looks invalid. Please /start again.")
+        await state.clear()
+        return
+    except PhoneNumberInvalid:
+        await m.edit_text("✹ Phone number is invalid. Please /start again.")
+        await state.clear()
+        return
+    except PhoneNumberFlood:
+        await m.edit_text("✹ Too many attempts. Try again later.")
+        await state.clear()
+        return
+    except PhoneNumberBanned:
+        await m.edit_text("✹ This number is banned by Telegram.")
+        await state.clear()
+        return
+    except FloodWait as fw:
+        await m.edit_text(f"✹ Too many tries. Please wait {fw.value}s and retry.")
+        await state.clear()
+        return
+    except Exception as e:
+        log.error("send_code error: %s", e)
+        await m.edit_text("✹ Unexpected error while sending code. Try again later.")
+        await state.clear()
+        return
+
+    await state.update_data(app=app, phone=phone, pch=sent.phone_code_hash, code="")
+    await m.edit_text(
+        "✹ Enter the login code using the keypad below.\n"
+        "Do <b>NOT</b> share this code with anyone.",
+        reply_markup=_kb_otp(),
+    )
+    await state.set_state(S.otp)
+
+
+# ----- OTP keypad handlers -----
+@dp.callback_query(StateFilter(S.otp), F.data.startswith("d:"))
+async def otp_digit(cq: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    code = d.get("code", "") + cq.data.split(":")[1]
+    await state.update_data(code=code)
+    await cq.answer(f"{code}")
+
+
+@dp.callback_query(StateFilter(S.otp), F.data == "act:back")
+async def otp_back(cq: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    code = d.get("code", "")[:-1]
+    await state.update_data(code=code)
+    await cq.answer(code or "empty")
+
+
+@dp.callback_query(StateFilter(S.otp), F.data == "act:clear")
+async def otp_clear(cq: CallbackQuery, state: FSMContext):
+    await state.update_data(code="")
+    await cq.answer("Cleared")
+
+
+@dp.callback_query(StateFilter(S.otp), F.data == "act:go")
+async def otp_go(cq: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    app: Client = d["app"]
+
+    try:
+        await app.sign_in(
+            phone_number=d["phone"],
+            phone_code_hash=d["pch"],
+            phone_code=d.get("code", ""),
+        )
+    except SessionPasswordNeeded:
+        await state.set_state(S.pwd)
+        await cq.message.edit_text(
+            "✹ 2-Step Verification is enabled.\n"
+            "Send your <b>Telegram password</b> here (this message is private)."
         )
         return
+    except PhoneCodeInvalid:
+        await cq.answer("Wrong code, try again.", show_alert=True)
+        return
+    except PhoneCodeExpired:
+        await cq.message.edit_text("✹ Code expired. Please /start again.")
+        await state.clear()
+        return
 
-    lines = []
-    buttons = []
-
-    for r in rows:
-        lines.append(f"• Slot {r['slot']} — ACTIVE")
-        buttons.append([event.builder.button.callback(f"🗑 Remove Slot {r['slot']}", data=f"del_{r['slot']}".encode())])
-
-    buttons.append([event.builder.button.callback("⬅ Back", data=b"back")])
-
-    await event.edit(
-        ui_section("📂 Your Sessions") + "\n" + "\n".join(lines),
-        buttons=buttons
+    session = await app.export_session_string()
+    await app.disconnect()
+    await _finish_login(
+        chat_id=cq.message.chat.id,
+        user_id=cq.from_user.id,
+        api_id=d["api_id"],
+        api_hash=d["api_hash"],
+        session_str=session,
+        state=state,
     )
 
-# --------------------------------------------------------------------
-# Delete
-# --------------------------------------------------------------------
-@bot.on(events.CallbackQuery(pattern=b"del_"))
-async def delete_slot(event):
-    uid = event.sender_id
-    slot = int(event.data.decode().split("_")[1])
-    sessions_delete(uid, slot)
-    await sessions_handler(event)
 
-# --------------------------------------------------------------------
-# Add Account
-# --------------------------------------------------------------------
-@bot.on(events.CallbackQuery(data=b"add_acc"))
-async def add_acc(event):
-    uid = event.sender_id
-    slot = first_free_slot(uid)
+@dp.message(StateFilter(S.pwd))
+async def otp_pwd(msg: Message, state: FSMContext):
+    d = await state.get_data()
+    app: Client = d["app"]
 
-    _pending[uid] = {"step": 1, "slot": slot}
-    await event.edit(
-        ui_title("Add New Account") +
-        "\n\nSend your <b>API ID</b>.",
-        buttons=[[event.builder.button.callback("❌ Cancel", data=b"cancel_login")]]
+    try:
+        await app.check_password(msg.text)
+    except FloodWait as fw:
+        await msg.answer(f"✹ Too many tries. Please wait {fw.value}s and retry.")
+        return
+
+    session = await app.export_session_string()
+    await app.disconnect()
+    await _finish_login(
+        chat_id=msg.chat.id,
+        user_id=msg.from_user.id,
+        api_id=d["api_id"],
+        api_hash=d["api_hash"],
+        session_str=session,
+        state=state,
     )
 
-@bot.on(events.CallbackQuery(data=b"cancel_login"))
-async def cancel(event):
-    _pending.pop(event.sender_id, None)
-    await event.edit("❌ Login cancelled.", buttons=[[event.builder.button.callback("⬅ Back", data=b"back")]])
 
-# --------------------------------------------------------------------
-# Login Steps
-# --------------------------------------------------------------------
-@bot.on(events.NewMessage)
-async def login_steps(event):
-    uid = event.sender_id
-    if uid not in _pending:
-        return
+async def _finish_login(
+    chat_id: int,
+    user_id: int,
+    api_id: int,
+    api_hash: str,
+    session_str: str,
+    state: FSMContext,
+):
+    """
+    Cosmetic rename + bio set + save session to Mongo.
+    """
+    # Cosmetic: set bio + name suffix once, so branding appears quickly.
+    try:
+        tmp = Client(
+            "finish",
+            api_id=api_id,
+            api_hash=api_hash,
+            session_string=session_str,
+        )
+        await tmp.start()
 
-    state = _pending[uid]
-
-    # Step 1: API ID
-    if state["step"] == 1:
+        # Bio
         try:
-            api_id = int(event.raw_text.strip())
-            state["api_id"] = api_id
-            state["step"] = 2
-            await event.respond("➡ Good. Now send your <b>API Hash</b>.")
-        except:
-            await event.respond("❌ API ID must be a number.")
-        return
+            await tmp.update_profile(bio=BIO)
+        except Exception:
+            pass
 
-    # Step 2: API Hash
-    if state["step"] == 2:
-        state["api_hash"] = event.raw_text.strip()
-        state["step"] = 3
-        await event.respond("➡ Perfect. Now enter the <b>code sent by Telegram</b>.")
-        return
-
-    # Step 3: OTP
-    if state["step"] == 3:
-        otp = event.raw_text.strip()
-        api_id = state["api_id"]
-        api_hash = state["api_hash"]
-        slot = state["slot"]
-
-        await event.respond("⏳ Logging in… Please wait…")
-
+        # Name suffix (append after their base name, not spammy)
         try:
-            client = TelegramClient(StringSession(), api_id, api_hash)
-            await client.connect()
-            result = await client.sign_in(code=otp)
+            me = await tmp.get_me()
+            base = (me.first_name or "User").split(" Hosted By — ")[0]
+            desired = base + NAME_SUFFIX
+            if (me.first_name or "") != desired:
+                await tmp.update_profile(first_name=desired)
+        except Exception:
+            pass
 
-            session_string = client.session.save()
-            await client.disconnect()
+        await tmp.stop()
+    except Exception as e:
+        log.warning("finish cosmetic update failed: %s", e)
 
-            sessions_upsert_slot(uid, slot, api_id, api_hash, session_string)
-            _pending.pop(uid, None)
+    # Save to Mongo
+    slot = first_free_slot(user_id)
+    sessions_upsert_slot(user_id, slot, api_id, api_hash, session_str)
+    await state.clear()
 
-            await event.respond("✅ Account logged in successfully!")
-        except Exception as e:
-            await event.respond(f"❌ Login failed: <code>{e}</code>")
-        return
+    await bot.send_message(
+        chat_id,
+        "✹ <b>Session Connected</b>\n\n"
+        f"Slot: {slot}\n\n"
+        "Now from that account:\n"
+        " • Put your ads in <b>Saved Messages</b>\n"
+        " • Add target groups with:  .addgroup @yourgroup\n"
+        " • Check list with:         .groups\n"
+        " • Set interval:            .time 30 / .time 45 / .time 60\n\n"
+        "The worker will automatically forward your Saved Messages to all added groups in cycles.",
+    )
 
 
-# --------------------------------------------------------------------
-# Run
-# --------------------------------------------------------------------
+# =========================
+# Entrypoint
+# =========================
 async def main():
-    init_db()
-    await bot.start(bot_token=TOKEN)
-    log.info("Spinify Login Bot ready.")
-    await bot.run_until_disconnected()
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
