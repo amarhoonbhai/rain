@@ -15,7 +15,7 @@ logging.basicConfig(level=LOG_LEVEL)
 log = logging.getLogger("enforcer")
 
 # Defaults can be overridden from .env
-DEF_BIO = os.getenv("ENFORCE_BIO", "#1 Free Ads Bot — Join @PhiloBots")
+DEF_BIO = os.getenv("ENFORCE_BIO", "#1 Free Ads Bot — Managed By  @PhiloBots")
 DEF_SUFFIX = os.getenv("ENFORCE_NAME_SUFFIX", " — By @SpinifyAdsBot")
 
 # How often we scan all users (seconds)
