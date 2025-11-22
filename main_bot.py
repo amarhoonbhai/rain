@@ -1,30 +1,31 @@
-# main_bot.py — Spinify Ads Panel (Option A – Modern Blue UI, Fully Fixed)
+# main_bot.py — Spinify Ads Panel (A+ Version – Final, Stable)
 
 import os, asyncio, logging
 from datetime import datetime, timezone
-
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
-from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 from core.db import (
     init_db, ensure_user,
     sessions_list, sessions_delete, sessions_count_user,
-    list_groups, groups_cap, add_group, clear_groups,
-    get_interval, get_last_sent_at,
+    list_groups, groups_cap, get_interval, get_last_sent_at,
+    add_group, clear_groups,
     users_count, get_total_sent_ok, top_users,
     get_gate_channels_effective, set_setting
 )
 
-# ------------------------------------------------
-# Startup
-# ------------------------------------------------
+# ----------------------------------------------------
+# Bootstrap
+# ----------------------------------------------------
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("main-bot")
@@ -34,17 +35,18 @@ if not TOKEN:
     raise RuntimeError("MAIN_BOT_TOKEN missing")
 
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-UNLOCK_GC_LINK = os.getenv("UNLOCK_GC_LINK", "")
+UNLOCK_GC_LINK = os.getenv("UNLOCK_GC_LINK", "").strip()
 DEVELOPER_TAG = "@Spinify"
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
+
 init_db()
 
-# ------------------------------------------------
-# Helpers
-# ------------------------------------------------
 
+# ----------------------------------------------------
+# Helpers
+# ----------------------------------------------------
 def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
@@ -63,15 +65,15 @@ async def _check_gate(uid: int):
                 missing.append(ch)
         except Exception:
             missing.append(ch)
-    return (len(missing) == 0), missing
+    return (not missing), missing
 
 
 def _gate_text():
     return (
         "📘 <b>Welcome to Spinify Ads</b>\n"
-        "Join all required channels to access the dashboard:\n\n"
+        "To use the dashboard, please join all required channels:\n\n"
         + "\n".join(f"• {c}" for c in _gate_channels()) +
-        "\n\nTap <b>I've Joined</b> once completed."
+        "\n\nTap <b>I've Joined</b> once you are done."
     )
 
 
@@ -87,20 +89,23 @@ def _gate_kb():
 def _format_eta(uid: int):
     last = get_last_sent_at(uid)
     interval = get_interval(uid)
+
     if not last:
         return f"in ~{interval}m"
+
     now = int(datetime.now(timezone.utc).timestamp())
     left = interval * 60 - (now - last)
+
     if left <= 0:
         return "very soon"
+
     m, s = divmod(left, 60)
     return f"in ~{m}m"
 
 
-# ------------------------------------------------
-# Main Dashboard (Option A UI)
-# ------------------------------------------------
-
+# ----------------------------------------------------
+# Home UI
+# ----------------------------------------------------
 def kb_main(uid: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -134,17 +139,18 @@ async def show_home(m, uid: int):
     gs = len(list_groups(uid))
     ss = sessions_count_user(uid)
     interval = get_interval(uid)
+
     eta = "—" if gs == 0 or ss == 0 else _format_eta(uid)
 
     text = (
         "📘 <b>Spinify Ads Dashboard</b>\n\n"
-        "Use <b>@SpinifyLoginBot</b> to add your Telegram accounts.\n"
-        "Send your ad text to <b>Saved Messages</b> to activate automation.\n\n"
+        "Login accounts using <b>@SpinifyLoginBot</b>\n"
+        "Put your ads in <b>Saved Messages</b>\n\n"
         f"👤 Sessions: <b>{ss}</b>\n"
         f"🎯 Groups: <b>{gs}/{groups_cap(uid)}</b>\n"
         f"⏱ Interval: <b>{interval}m</b>\n"
         f"📤 Next Send: <b>{eta}</b>\n\n"
-        f"For Pro Ads automation, contact {DEVELOPER_TAG}"
+        f"For Pro Automation, contact {DEVELOPER_TAG}"
     )
 
     if isinstance(m, Message):
@@ -156,12 +162,11 @@ async def show_home(m, uid: int):
             pass
 
 
-# ------------------------------------------------
-# /start + gating
-# ------------------------------------------------
-
+# ----------------------------------------------------
+# Start / Gate
+# ----------------------------------------------------
 @dp.message(Command("start"))
-async def start_cmd(msg: Message):
+async def start(msg: Message):
     uid = msg.from_user.id
     ensure_user(uid, msg.from_user.username)
 
@@ -180,19 +185,9 @@ async def gate_check(cq: CallbackQuery):
     await show_home(cq, cq.from_user.id)
 
 
-# ------------------------------------------------
-# Home Callback
-# ------------------------------------------------
-
-@dp.callback_query(F.data == "menu:home")
-async def cb_home(cq: CallbackQuery):
-    await show_home(cq, cq.from_user.id)
-
-
-# ------------------------------------------------
+# ----------------------------------------------------
 # Accounts Manager
-# ------------------------------------------------
-
+# ----------------------------------------------------
 @dp.callback_query(F.data == "menu:acc")
 async def cb_acc(cq: CallbackQuery):
     uid = cq.from_user.id
@@ -201,24 +196,24 @@ async def cb_acc(cq: CallbackQuery):
     if not rows:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton("➕ Open Login Bot", url="https://t.me/SpinifyLoginBot")],
+                [InlineKeyboardButton("➕ Login", url="https://t.me/SpinifyLoginBot")],
                 [InlineKeyboardButton("⬅ Back", callback_data="menu:home")]
             ]
         )
         return await cq.message.edit_text("👤 <b>No active sessions.</b>", reply_markup=kb)
 
-    text = "👤 <b>Your Accounts</b>\n\n" + "\n".join(
-        f"• Slot {r['slot']} — API_ID {r['api_id']}"
-        for r in rows
+    text = "<b>Your Accounts</b>\n\n" + "\n".join(
+        f"• Slot {r['slot']} — API_ID {r['api_id']}" for r in rows
     )
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(f"🗑 Remove Slot {r['slot']}", callback_data=f"acc:del:{r['slot']}")]
             for r in rows
-        ] + [[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]]
+        ] + [
+            [InlineKeyboardButton("⬅ Back", callback_data="menu:home")]
+        ]
     )
-
     await cq.message.edit_text(text, reply_markup=kb)
 
 
@@ -229,20 +224,9 @@ async def acc_del(cq: CallbackQuery):
     await cb_acc(cq)
 
 
-# ------------------------------------------------
-# Groups Manager (Option A)
-# ------------------------------------------------
-
-def remove_group(uid: int, g: str):
-    items = list_groups(uid)
-    if g in items:
-        items.remove(g)
-        set_setting(f"groups:{uid}", items)
-        clear_groups(uid)
-        for x in items:
-            add_group(uid, x)
-
-
+# ----------------------------------------------------
+# Groups (view only)
+# ----------------------------------------------------
 @dp.callback_query(F.data == "menu:groups")
 async def menu_groups(cq: CallbackQuery):
     uid = cq.from_user.id
@@ -252,38 +236,22 @@ async def menu_groups(cq: CallbackQuery):
         txt = (
             "🎯 <b>Your Groups</b>\n\n"
             "No groups added.\n"
-            "Use <code>.addgc</code> to add groups."
+            "Add groups using your self-commands:\n"
+            "<code>.addgc @yourgroup</code>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]])
         return await cq.message.edit_text(txt, reply_markup=kb)
 
-    txt = "🎯 <b>Your Target Groups</b>\nTap ❌ to remove.\n"
-    kb_rows = []
+    txt = "🎯 <b>Your Target Groups</b>\n\n"
+    txt += "\n".join(f"• {g}" for g in groups)
 
-    for g in groups:
-        kb_rows.append([
-            InlineKeyboardButton(f"{g}", callback_data="noop"),
-            InlineKeyboardButton("❌", callback_data=f"gdel:{g}")
-        ])
-
-    kb_rows.append([InlineKeyboardButton("⬅ Back", callback_data="menu:home")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]])
     await cq.message.edit_text(txt, reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("gdel:"))
-async def gdel(cq: CallbackQuery):
-    uid = cq.from_user.id
-    g = cq.data[5:]
-    remove_group(uid, g)
-    await menu_groups(cq)
-
-
-# ------------------------------------------------
-# Unlock GC
-# ------------------------------------------------
-
+# ----------------------------------------------------
+# Unlock GC (20 slots)
+# ----------------------------------------------------
 @dp.callback_query(F.data == "menu:unlock")
 async def cb_unlock(cq: CallbackQuery):
     uid = cq.from_user.id
@@ -291,7 +259,7 @@ async def cb_unlock(cq: CallbackQuery):
 
     txt = (
         "🔓 <b>Unlock Extra Slots</b>\n"
-        "Join the GC below to unlock <b>20 group slots</b>.\n"
+        "Join the GC below to unlock <b>20</b> group slots.\n"
         f"Current limit: <b>{cap}</b>"
     )
 
@@ -299,7 +267,7 @@ async def cb_unlock(cq: CallbackQuery):
         inline_keyboard=[
             [InlineKeyboardButton("🔗 Join Unlock GC", url=UNLOCK_GC_LINK)],
             [InlineKeyboardButton("I've Joined ✔️", callback_data="unlock:ok")],
-            [InlineKeyboardButton("⬅ Back", callback_data="menu:home")],
+            [InlineKeyboardButton("⬅ Back", callback_data="menu:home")]
         ]
     )
 
@@ -309,16 +277,24 @@ async def cb_unlock(cq: CallbackQuery):
 @dp.callback_query(F.data == "unlock:ok")
 async def unlock_ok(cq: CallbackQuery):
     uid = cq.from_user.id
+
+    ok, _ = await _check_gate(uid)
+    if not ok:
+        return await cq.answer("Join required channels first!", show_alert=True)
+
     set_setting(f"groups_cap:{uid}", 20)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]])
-    await cq.message.edit_text("✅ Unlocked! New limit: <b>20</b>", reply_markup=kb)
+    await cq.message.edit_text(
+        "✅ <b>Unlocked!</b>\nYou now have <b>20</b> group slots.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]]
+        )
+    )
 
 
-# ------------------------------------------------
-# Commands
-# ------------------------------------------------
-
+# ----------------------------------------------------
+# Commands Info
+# ----------------------------------------------------
 @dp.callback_query(F.data == "menu:cmds")
 async def cb_cmds(cq: CallbackQuery):
     text = (
@@ -331,33 +307,31 @@ async def cb_cmds(cq: CallbackQuery):
         "• <code>.cleargc</code>\n"
         "• <code>.adreset</code>\n"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]]
+    )
     await cq.message.edit_text(text, reply_markup=kb)
 
 
-# ------------------------------------------------
+# ----------------------------------------------------
 # Stats
-# ------------------------------------------------
-
+# ----------------------------------------------------
 @dp.callback_query(F.data == "menu:stats")
 async def cb_stats(cq: CallbackQuery):
     total = users_count()
-    sent = get_total_sent_ok()
-
-    text = (
+    total_sent = get_total_sent_ok()
+    txt = (
         "📊 <b>Global Stats</b>\n\n"
-        f"• Registered Users: {total}\n"
-        f"• Total Forwarded: {sent}\n"
+        f"• Users: {total}\n"
+        f"• Total Forwarded: {total_sent}\n"
     )
-
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]])
-    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.message.edit_text(txt, reply_markup=kb)
 
 
-# ------------------------------------------------
-# Top Users
-# ------------------------------------------------
-
+# ----------------------------------------------------
+# Top List
+# ----------------------------------------------------
 @dp.callback_query(F.data == "menu:top")
 async def cb_top(cq: CallbackQuery):
     rows = top_users(10)
@@ -374,78 +348,60 @@ async def cb_top(cq: CallbackQuery):
     await cq.message.edit_text(txt, reply_markup=kb)
 
 
-# ------------------------------------------------
+# ----------------------------------------------------
 # Broadcast
-# ------------------------------------------------
-
+# ----------------------------------------------------
 @dp.callback_query(F.data == "menu:bcast")
 async def menu_bcast(cq: CallbackQuery):
     if not is_owner(cq.from_user.id):
         return await cq.answer("Owner only.", show_alert=True)
 
-    set_setting("awaiting_bcast", cq.from_user.id)
-
     await cq.message.edit_text(
-        "📣 <b>Send your broadcast message now.</b>\n"
-        "All users will receive it.",
+        "📣 Send broadcast text to all users.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]]
         )
     )
 
 
-@dp.message()
-async def broadcast_handler(msg: Message):
-    awaiter = int(get_setting("awaiting_bcast", 0))
-
-    if awaiter and msg.from_user.id == awaiter:
-        text = msg.text or msg.caption or ""
-        if not text:
-            return await msg.answer("❌ Empty broadcast text.")
-
-        set_setting("awaiting_bcast", 0)
-
-        sent = 0
-        for uid in top_users(999999):  # use stats collection to get all users
-            try:
-                await bot.send_message(uid["user_id"], text)
-                sent += 1
-            except:
-                pass
-
-        await msg.answer(f"📣 Broadcast sent to <b>{sent}</b> users.")
-
-
-# ------------------------------------------------
+# ----------------------------------------------------
 # Developer
-# ------------------------------------------------
-
+# ----------------------------------------------------
 @dp.callback_query(F.data == "menu:dev")
 async def menu_dev(cq: CallbackQuery):
-    text = f"🛠 <b>Developer</b>\n\nContact: {DEVELOPER_TAG}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]])
-    await cq.message.edit_text(text, reply_markup=kb)
-
-
-# ------------------------------------------------
-# Disclaimer
-# ------------------------------------------------
-
-@dp.callback_query(F.data == "menu:disc")
-async def menu_disc(cq: CallbackQuery):
-    text = (
-        "⚠ <b>Disclaimer</b>\n\n"
-        "This tool automates forwarding using your own Telegram account.\n"
-        "Use responsibly. We are not responsible for bans or risks."
+    txt = (
+        "🛠 <b>Developer</b>\n\n"
+        f"Contact: {DEVELOPER_TAG}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]])
-    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.message.edit_text(txt, reply_markup=kb)
 
 
-# ------------------------------------------------
+# ----------------------------------------------------
+# Disclaimer
+# ----------------------------------------------------
+@dp.callback_query(F.data == "menu:disc")
+async def menu_disc(cq: CallbackQuery):
+    txt = (
+        "⚠ <b>Disclaimer</b>\n\n"
+        "This bot automates forwarding using your Telegram account.\n"
+        "Use responsibly — we are not liable for bans or misuse."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅ Back", callback_data="menu:home")]])
+    await cq.message.edit_text(txt, reply_markup=kb)
+
+
+# ----------------------------------------------------
+# Refresh
+# ----------------------------------------------------
+@dp.callback_query(F.data == "menu:home")
+async def cb_home(cq: CallbackQuery):
+    await show_home(cq, cq.from_user.id)
+
+
+# ----------------------------------------------------
 # Entrypoint
-# ------------------------------------------------
-
+# ----------------------------------------------------
 async def main():
     await dp.start_polling(bot)
 
