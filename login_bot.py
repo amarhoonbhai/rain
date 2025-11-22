@@ -1,280 +1,278 @@
-import os, asyncio, logging
-from datetime import datetime, timedelta
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+# login_bot.py — Spinify Login Bot (Blue Glow UI)
+import os
+import asyncio
+import logging
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from dotenv import load_dotenv
 
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    ApiIdInvalidError,
-    PhoneNumberInvalidError,
-    PhoneNumberFloodError,
-    PhoneNumberBannedError,
-    FloodWaitError,
-    RPCError,
+from core.db import (
+    init_db, ensure_user,
+    sessions_list, sessions_upsert_slot,
+    sessions_delete, first_free_slot
 )
-
-from core.db import init_db, ensure_user, first_free_slot, sessions_upsert_slot
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("login-bot")
 
-TOKEN = os.getenv("LOGIN_BOT_TOKEN", "").strip()
+TOKEN = (os.getenv("LOGIN_BOT_TOKEN") or "").strip()
 if not TOKEN or ":" not in TOKEN:
     raise RuntimeError("LOGIN_BOT_TOKEN missing")
 
-BIO = os.getenv("ENFORCE_BIO", "#1 Free Ads Bot — Join @PhiloBots")
-SUFFIX = os.getenv("ENFORCE_NAME_SUFFIX", " — via @SpinifyAdsBot")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
-init_db()
+REQUIRED_CHANNELS = [
+    c.strip() for c in (os.getenv("REQUIRED_CHANNELS", "").split(",")) if c.strip()
+]
 
+bot = TelegramClient("login-bot", 0, "")
+bot.parse_mode = "html"
 
-class S(StatesGroup):
-    api_id = State()
-    api_hash = State()
-    phone = State()
-    otp = State()
-    pwd = State()
+# --------------------------------------------------------------------
+# Blue Glow UI Helpers
+# --------------------------------------------------------------------
+def ui_title(text: str) -> str:
+    return f"✨ <b>{text}</b> ✨"
 
+def ui_section(text: str) -> str:
+    return f"<b>{text}</b>"
 
-def _kb_otp():
-    rows = [
-        [InlineKeyboardButton(text=str(i), callback_data=f"d:{i}") for i in (1, 2, 3)],
-        [InlineKeyboardButton(text=str(i), callback_data=f"d:{i}") for i in (4, 5, 6)],
-        [InlineKeyboardButton(text=str(i), callback_data=f"d:{i}") for i in (7, 8, 9)],
-        [InlineKeyboardButton(text="0", callback_data="d:0")],
-        [
-            InlineKeyboardButton(text="⬅", callback_data="act:back"),
-            InlineKeyboardButton(text="🧹", callback_data="act:clear"),
-            InlineKeyboardButton(text="✔", callback_data="act:go"),
-        ],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.message(Command("start"))
-async def start(msg: Message, state: FSMContext):
-    ensure_user(msg.from_user.id, msg.from_user.username)
-    await msg.answer("✇ Send your <b>API_ID</b> (number)")
-    await state.set_state(S.api_id)
-
-
-@dp.message(StateFilter(S.api_id))
-async def api_id(msg: Message, state: FSMContext):
-    try:
-        aid = int(msg.text.strip())
-    except Exception:
-        await msg.answer("❌ number required")
-        return
-    await state.update_data(api_id=aid)
-    await state.set_state(S.api_hash)
-    await msg.answer("✇ Send your <b>API_HASH</b>")
-
-
-@dp.message(StateFilter(S.api_hash))
-async def api_hash(msg: Message, state: FSMContext):
-    await state.update_data(api_hash=msg.text.strip())
-    await state.set_state(S.phone)
-    await msg.answer("✇ Send phone in international format, e.g. <b>+9198xxxxxxx</b>")
-
-
-async def _send_code(aid: int, ah: str, phone: str) -> tuple[TelegramClient, object]:
-    """
-    Create Telethon client in-memory and send login code.
-    """
-    client = TelegramClient(StringSession(), aid, ah)
-    await client.connect()
-    sent = await client.send_code_request(phone)
-    return client, sent
-
-
-@dp.message(StateFilter(S.phone))
-async def phone(msg: Message, state: FSMContext):
-    d = await state.get_data()
-    aid, ah = d["api_id"], d["api_hash"]
-    phone = msg.text.strip()
-    m = await msg.answer("✇ Sending code…")
-
-    try:
-        app, sent = await _send_code(aid, ah, phone)
-    except ApiIdInvalidError:
-        await m.edit_text("❌ API_ID/HASH invalid")
-        return
-    except PhoneNumberInvalidError:
-        await m.edit_text("❌ phone invalid")
-        return
-    except PhoneNumberFloodError:
-        await m.edit_text("⏳ too many attempts, phone is flood-limited")
-        return
-    except PhoneNumberBannedError:
-        await m.edit_text("❌ this number is banned by Telegram")
-        return
-    except FloodWaitError as fw:
-        await m.edit_text(f"⏳ Flood wait: try again after {fw.seconds}s")
-        return
-    except RPCError as e:
-        await m.edit_text(f"❌ Telegram error: {e}")
-        return
-    except Exception as e:
-        log.error("send_code error: %s", e)
-        await m.edit_text("❌ Unexpected error while sending code.")
-        return
-
-    await state.update_data(app=app, phone=phone, pch=sent.phone_code_hash, code="")
-    await m.edit_text("✇ Enter code", reply_markup=_kb_otp())
-    await state.set_state(S.otp)
-
-
-# ===== OTP keypad handlers =====
-
-@dp.callback_query(StateFilter(S.otp), F.data.startswith("d:"))
-async def otp_digit(cq: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    code = d.get("code", "") + cq.data.split(":")[1]
-    await state.update_data(code=code)
-    await cq.answer()
-
-
-@dp.callback_query(StateFilter(S.otp), F.data == "act:back")
-async def otp_back(cq: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    code = d.get("code", "")[:-1]
-    await state.update_data(code=code)
-    await cq.answer()
-
-
-@dp.callback_query(StateFilter(S.otp), F.data == "act:clear")
-async def otp_clear(cq: CallbackQuery, state: FSMContext):
-    await state.update_data(code="")
-    await cq.answer("cleared")
-
-
-@dp.callback_query(StateFilter(S.otp), F.data == "act:go")
-async def otp_go(cq: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    app: TelegramClient = d["app"]
-    phone = d["phone"]
-    pch = d["pch"]
-    code = d.get("code", "")
-
-    try:
-        await app.sign_in(phone=phone, code=code, phone_code_hash=pch)
-    except SessionPasswordNeededError:
-        await state.set_state(S.pwd)
-        await cq.message.edit_text("2FA enabled. Send password.")
-        return
-    except PhoneCodeInvalidError:
-        await cq.answer("wrong code", show_alert=True)
-        return
-    except PhoneCodeExpiredError:
-        await cq.message.edit_text("Code expired. /start")
-        await state.clear()
+# --------------------------------------------------------------------
+# Channel Gate
+# --------------------------------------------------------------------
+async def check_gate(user_id: int):
+    missing = []
+    for ch in REQUIRED_CHANNELS:
         try:
-            await app.disconnect()
+            m = await bot.get_permissions(ch, user_id)
+            if m is None:
+                missing.append(ch)
         except Exception:
-            pass
-        return
-    except FloodWaitError as fw:
-        await cq.message.edit_text(f"⏳ Flood wait: try again after {fw.seconds}s")
-        return
-    except RPCError as e:
-        await cq.message.edit_text(f"❌ Telegram error: {e}")
-        return
-    except Exception as e:
-        log.error("sign_in error: %s", e)
-        await cq.message.edit_text("❌ Unexpected error during sign in.")
-        return
+            missing.append(ch)
+    return missing
 
-    # No 2FA, login complete
-    session = app.session.save()
-    await app.disconnect()
-    await _finish(
-        chat_id=cq.message.chat.id,
-        user_id=cq.from_user.id,
-        api_id=d["api_id"],
-        api_hash=d["api_hash"],
-        session_str=session,
-        state=state,
+async def gate_message():
+    lines = "\n".join(f"• {c}" for c in REQUIRED_CHANNELS)
+    return (
+        "🔐 <b>Access Required</b>\n\n"
+        "You must join these channels to use Spinify Login Bot:\n"
+        f"{lines}\n\n"
+        "Tap <b>I’ve Joined</b> after joining."
     )
 
+def gate_keyboard():
+    rows = []
+    for c in REQUIRED_CHANNELS:
+        rows.append([("/join_" + c, f"🔗 Join {c}")])
+    return None
 
-@dp.message(StateFilter(S.pwd))
-async def otp_pwd(msg: Message, state: FSMContext):
-    d = await state.get_data()
-    app: TelegramClient = d["app"]
-    try:
-        await app.sign_in(password=msg.text)
-    except FloodWaitError as fw:
-        await msg.answer(f"⏳ Flood wait: try again after {fw.seconds}s")
-        return
-    except RPCError as e:
-        await msg.answer(f"❌ Error: {e}")
+# --------------------------------------------------------------------
+# Memory for login state
+# --------------------------------------------------------------------
+_pending = {}
+
+# --------------------------------------------------------------------
+# /start
+# --------------------------------------------------------------------
+@bot.on(events.NewMessage(pattern="^/start"))
+async def start_handler(event):
+    uid = event.sender_id
+    ensure_user(uid, event.sender.username)
+
+    # Check gate
+    missing = await check_gate(uid)
+    if missing:
+        buttons = []
+        for ch in missing:
+            buttons.append([event.builder.button.url(f"🔗 Join {ch}", f"https://t.me/{ch.lstrip('@')}")])
+        buttons.append([event.builder.button.callback("✅ I’ve Joined", data=b"gate_check")])
+        await event.respond(await gate_message(), buttons=buttons)
         return
 
-    session = app.session.save()
-    await app.disconnect()
-    await _finish(
-        chat_id=msg.chat.id,
-        user_id=msg.from_user.id,
-        api_id=d["api_id"],
-        api_hash=d["api_hash"],
-        session_str=session,
-        state=state,
+    # Main menu
+    await event.respond(
+        ui_title("SPINIFY LOGIN BOT") + "\n\n"
+        "Add your Telegram accounts safely.\n"
+        "These accounts will be used for auto-forwarding.\n\n"
+        "Choose an option:",
+        buttons=[
+            [event.builder.button.callback("➕ Add New Account", data=b"add_acc")],
+            [event.builder.button.callback("📂 My Sessions", data=b"sessions")],
+            [event.builder.button.callback("ℹ️ Help", data=b"help")],
+            [event.builder.button.callback("👨‍💻 Developer", data=b"dev")]
+        ]
     )
 
+# --------------------------------------------------------------------
+# Gate Check
+# --------------------------------------------------------------------
+@bot.on(events.CallbackQuery(data=b"gate_check"))
+async def gate_check_handler(event):
+    uid = event.sender_id
+    missing = await check_gate(uid)
+    if missing:
+        await event.answer("❌ Still missing channels.", alert=True)
+        return
+    await start_handler(event)
 
-async def _finish(chat_id: int, user_id: int, api_id: int, api_hash: str, session_str: str, state: FSMContext):
-    """
-    Save session in Mongo and do cosmetic bio/name update once.
-    """
-    # cosmetic: update bio + suffix once
-    try:
-        tmp = TelegramClient(StringSession(session_str), api_id, api_hash)
-        await tmp.connect()
-        try:
-            await tmp.update_profile(about=BIO)
-        except Exception:
-            pass
-        try:
-            me = await tmp.get_me()
-            base = (me.first_name or "User").split(" — ")[0]
-            desired = base + SUFFIX
-            if (me.first_name or "") != desired:
-                await tmp.update_profile(first_name=desired)
-        except Exception:
-            pass
-        await tmp.disconnect()
-    except Exception as e:
-        log.warning("cosmetic profile update failed: %s", e)
+# --------------------------------------------------------------------
+# Help
+# --------------------------------------------------------------------
+@bot.on(events.CallbackQuery(data=b"help"))
+async def help_handler(event):
+    text = (
+        ui_title("How to Login") + "\n\n"
+        "1️⃣ Go to https://my.telegram.org\n"
+        "2️⃣ Create API ID & API Hash\n"
+        "3️⃣ Tap <b>Add New Account</b>\n"
+        "4️⃣ Enter your API ID & Hash\n"
+        "5️⃣ Enter OTP sent by Telegram\n\n"
+        "Your session will be securely saved."
+    )
+    await event.edit(text, buttons=[[event.builder.button.callback("⬅ Back", data=b"back")]])
 
-    slot = first_free_slot(user_id)
-    sessions_upsert_slot(user_id, slot, api_id, api_hash, session_str)
-    await state.clear()
-
-    await bot.send_message(
-        chat_id,
-        f"✅ Session saved in Slot {slot}.\n"
-        "Put your ads in <b>Saved Messages</b> (text/media ok).\n"
-        "Worker will forward them in cycle.\n"
-        "Use commands from your account: <code>.addgc</code>, <code>.gc</code>, "
-        "<code>.cleargc</code>, <code>.time</code>, <code>.adreset</code>, <code>.status</code>.",
+# --------------------------------------------------------------------
+# Developer
+# --------------------------------------------------------------------
+@bot.on(events.CallbackQuery(data=b"dev"))
+async def dev_handler(event):
+    await event.edit(
+        ui_title("Developer") +
+        "\n\n👨‍💻 <b>@SpinifyAdsBot</b>",
+        buttons=[[event.builder.button.callback("⬅ Back", data=b"back")]]
     )
 
+# --------------------------------------------------------------------
+# Back
+# --------------------------------------------------------------------
+@bot.on(events.CallbackQuery(data=b"back"))
+async def back_handler(event):
+    await start_handler(event)
 
+# --------------------------------------------------------------------
+# Sessions Screen
+# --------------------------------------------------------------------
+@bot.on(events.CallbackQuery(data=b"sessions"))
+async def sessions_handler(event):
+    uid = event.sender_id
+    rows = sessions_list(uid)
+
+    if not rows:
+        await event.edit(
+            ui_section("📂 Your Sessions") +
+            "\nNo accounts added yet.",
+            buttons=[[event.builder.button.callback("⬅ Back", data=b"back")]]
+        )
+        return
+
+    lines = []
+    buttons = []
+
+    for r in rows:
+        lines.append(f"• Slot {r['slot']} — ACTIVE")
+        buttons.append([event.builder.button.callback(f"🗑 Remove Slot {r['slot']}", data=f"del_{r['slot']}".encode())])
+
+    buttons.append([event.builder.button.callback("⬅ Back", data=b"back")])
+
+    await event.edit(
+        ui_section("📂 Your Sessions") + "\n" + "\n".join(lines),
+        buttons=buttons
+    )
+
+# --------------------------------------------------------------------
+# Delete
+# --------------------------------------------------------------------
+@bot.on(events.CallbackQuery(pattern=b"del_"))
+async def delete_slot(event):
+    uid = event.sender_id
+    slot = int(event.data.decode().split("_")[1])
+    sessions_delete(uid, slot)
+    await sessions_handler(event)
+
+# --------------------------------------------------------------------
+# Add Account
+# --------------------------------------------------------------------
+@bot.on(events.CallbackQuery(data=b"add_acc"))
+async def add_acc(event):
+    uid = event.sender_id
+    slot = first_free_slot(uid)
+
+    _pending[uid] = {"step": 1, "slot": slot}
+    await event.edit(
+        ui_title("Add New Account") +
+        "\n\nSend your <b>API ID</b>.",
+        buttons=[[event.builder.button.callback("❌ Cancel", data=b"cancel_login")]]
+    )
+
+@bot.on(events.CallbackQuery(data=b"cancel_login"))
+async def cancel(event):
+    _pending.pop(event.sender_id, None)
+    await event.edit("❌ Login cancelled.", buttons=[[event.builder.button.callback("⬅ Back", data=b"back")]])
+
+# --------------------------------------------------------------------
+# Login Steps
+# --------------------------------------------------------------------
+@bot.on(events.NewMessage)
+async def login_steps(event):
+    uid = event.sender_id
+    if uid not in _pending:
+        return
+
+    state = _pending[uid]
+
+    # Step 1: API ID
+    if state["step"] == 1:
+        try:
+            api_id = int(event.raw_text.strip())
+            state["api_id"] = api_id
+            state["step"] = 2
+            await event.respond("➡ Good. Now send your <b>API Hash</b>.")
+        except:
+            await event.respond("❌ API ID must be a number.")
+        return
+
+    # Step 2: API Hash
+    if state["step"] == 2:
+        state["api_hash"] = event.raw_text.strip()
+        state["step"] = 3
+        await event.respond("➡ Perfect. Now enter the <b>code sent by Telegram</b>.")
+        return
+
+    # Step 3: OTP
+    if state["step"] == 3:
+        otp = event.raw_text.strip()
+        api_id = state["api_id"]
+        api_hash = state["api_hash"]
+        slot = state["slot"]
+
+        await event.respond("⏳ Logging in… Please wait…")
+
+        try:
+            client = TelegramClient(StringSession(), api_id, api_hash)
+            await client.connect()
+            result = await client.sign_in(code=otp)
+
+            session_string = client.session.save()
+            await client.disconnect()
+
+            sessions_upsert_slot(uid, slot, api_id, api_hash, session_string)
+            _pending.pop(uid, None)
+
+            await event.respond("✅ Account logged in successfully!")
+        except Exception as e:
+            await event.respond(f"❌ Login failed: <code>{e}</code>")
+        return
+
+
+# --------------------------------------------------------------------
+# Run
+# --------------------------------------------------------------------
 async def main():
-    await dp.start_polling(bot)
+    init_db()
+    await bot.start(bot_token=TOKEN)
+    log.info("Spinify Login Bot ready.")
+    await bot.run_until_disconnected()
 
 
 if __name__ == "__main__":
