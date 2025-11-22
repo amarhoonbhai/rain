@@ -1,103 +1,73 @@
-import os
+# profile_enforcer.py — A1 Compact Version
+# Keeps user profile BIO + NAME_SUFFIX enforced across all connected sessions.
+
 import asyncio
 import logging
-from typing import Dict
-
 from pyrogram import Client
-from pyrogram.errors import RPCError, SessionRevoked, AuthKeyUnregistered, FloodWait
-
 from core.db import init_db, users_with_sessions, sessions_list
+import os
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("enforcer")
 
-BIO_DEFAULT = "#1 Free Ads Bot — Managed By @PhiloBots"
-NAME_SUFFIX = "Cast By — @SpinifyAdsBot"
-
-SLEEP_SCAN = 300       # full scan interval
-MIN_GAP_PER_USER = 600 # minimum gap per user (seconds)
-MAX_CONCURRENCY = 3
-
-_last_run: Dict[int, float] = {}
+BIO = os.getenv("ENFORCE_BIO", "Managed by @PhiloBots")
+NAME_SUFFIX = os.getenv("ENFORCE_NAME_SUFFIX", " — By @SpinifyAdsBot")
 
 
-async def enforce_one(uid: int, slot: int, api_id: int, api_hash: str, session_string: str):
-    app = Client(
-        name=f"enf-{uid}-s{slot}",
-        api_id=api_id,
-        api_hash=api_hash,
-        session_string=session_string
-    )
-    try:
-        await app.start()
-    except (SessionRevoked, AuthKeyUnregistered):
-        log.info("enforcer: session revoked for u%s s%s", uid, slot)
-        return
-    except RPCError as e:
-        log.info("enforcer: RPC error u%s s%s: %s", uid, slot, e)
-        return
-    except Exception as e:
-        log.info("enforcer: start fail u%s s%s: %s", uid, slot, e)
+async def enforce_user(uid: int):
+    """Enforces name suffix + bio on all sessions of a user."""
+    sessions = sessions_list(uid)
+    if not sessions:
         return
 
-    try:
-        me = await app.get_me()
-        # Enforce first name suffix
-        base = (me.first_name or "User").strip()
-        if NAME_SUFFIX not in base:
-            new_name = f"{base}{NAME_SUFFIX}"
-        else:
-            new_name = base
-
+    for sess in sessions:
         try:
-            await app.update_profile(first_name=new_name)
-        except Exception as e:
-            log.debug("enforcer: name update fail u%s s%s: %s", uid, slot, e)
+            api_id = int(sess["api_id"])
+            api_hash = sess["api_hash"]
+            ss = sess["session_string"]
 
-        # Enforce bio
-        try:
-            await app.update_profile(bio=BIO_DEFAULT)
-        except Exception as e:
-            log.debug("enforcer: bio update fail u%s s%s: %s", uid, slot, e)
+            app = Client(
+                f"e{uid}_{sess['slot']}",
+                api_id=api_id,
+                api_hash=api_hash,
+                session_string=ss,
+                in_memory=True
+            )
+            await app.start()
 
-        log.info("enforcer: enforced u%s s%s", uid, slot)
+            # Apply BIO
+            try:
+                await app.update_profile(bio=BIO)
+            except Exception:
+                pass
 
-    finally:
-        try:
+            # Apply Name Suffix
+            try:
+                me = await app.get_me()
+                base = (me.first_name or "User").split(" — ")[0]
+                desired = base + NAME_SUFFIX
+
+                if me.first_name != desired:
+                    await app.update_profile(first_name=desired)
+            except Exception:
+                pass
+
             await app.stop()
-        except Exception:
-            pass
+
+        except Exception as e:
+            log.error(f"[Enforcer] Error user {uid}: {e}")
 
 
-async def main():
+async def start():
+    """Entry function called from run_all.py"""
     init_db()
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    loop = asyncio.get_running_loop()
-
-    log.info("profile_enforcer started | scan=%ss gap=%ss conc=%s",
-             SLEEP_SCAN, MIN_GAP_PER_USER, MAX_CONCURRENCY)
+    log.info("Enforcer: started.")
 
     while True:
-        now = loop.time()
-        for uid in users_with_sessions():
-            last = _last_run.get(uid, 0.0)
-            if now - last < MIN_GAP_PER_USER:
-                continue
-            _last_run[uid] = now
+        try:
+            users = users_with_sessions()  # from db.py
+            for uid in users:
+                await enforce_user(uid)
+        except Exception as e:
+            log.error(f"Enforcer main loop: {e}")
 
-            sessions = sessions_list(uid)
-            for s in sessions:
-                api_id = int(s["api_id"])
-                api_hash = str(s["api_hash"])
-                session_string = str(s["session_string"])
-                slot = int(s["slot"])
-
-                async with sem:
-                    asyncio.create_task(enforce_one(uid, slot, api_id, api_hash, session_string))
-                await asyncio.sleep(0.2)
-
-        await asyncio.sleep(SLEEP_SCAN)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        await asyncio.sleep(3600)  # run every 1 hour
