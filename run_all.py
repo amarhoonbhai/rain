@@ -1,13 +1,13 @@
 # run_all.py — async supervisor for all Telegram services
-#   - main_bot        (Aiogram main UI)
-#   - login_bot       (account login & session saver)
-#   - worker_forward  (Saved Messages forwarder - Telethon)
-#   - profile_enforcer (bio/name enforcer)
+#   - main_bot         (Aiogram main UI)
+#   - login_bot        (account login & session saver)
+#   - worker_forward   (Telethon forward worker)
+#   - profile_enforcer (Pyrogram name/bio enforcer)
 #
 # Features:
-#   • Per-service env validation (tokens + Mongo)
-#   • Safe import inside the service task (one bad import won’t kill others)
-#   • Auto-restart with simple exponential backoff
+#   • Shared .env loader (via core.mongo)
+#   • Per-service env validation
+#   • Auto-restart with backoff on crash
 #   • Periodic heartbeat
 #   • Clean SIGINT/SIGTERM shutdown
 #
@@ -21,21 +21,18 @@ import signal
 import logging
 from typing import Callable, Awaitable
 
-# --- Load environment (.env) before reading settings / Mongo URI ---
+# ---------- .env loading (shared with core.mongo) ----------
 try:
-    # Preferred: shared loader from core.mongo (handles repo root + .env.local)
     from core.mongo import _load_dotenv_best_effort  # type: ignore
-except Exception:  # optional dependency / import path
+except Exception:
     _load_dotenv_best_effort = None  # type: ignore
 
 if _load_dotenv_best_effort:
     try:
         _load_dotenv_best_effort()
     except Exception:
-        # Don't crash supervisor if .env loading fails; services will log details.
         pass
 else:
-    # Fallback: plain python-dotenv from current working dir
     try:
         from dotenv import load_dotenv  # type: ignore
     except Exception:
@@ -72,7 +69,7 @@ def _has_mongo_env() -> bool:
     if not uri:
         log.error("MONGO_URI missing in environment")
         return False
-    if dbn.strip() == "" or dbn.strip() == '" "' or dbn == " ":
+    if not dbn or dbn.strip() in {"", '" "', "' '"}:
         log.error("Bad database name in MONGO_DB_NAME (got %r)", dbn)
         return False
     return True
@@ -80,7 +77,7 @@ def _has_mongo_env() -> bool:
 
 def _has_token(env_key: str) -> bool:
     val = (os.getenv(env_key) or "").strip()
-    # basic sanity: aiogram-style tokens usually contain a colon
+    # aiogram tokens usually have :
     if not val or ":" not in val:
         log.error("%s missing or malformed", env_key)
         return False
@@ -96,12 +93,12 @@ def _ok_login_bot() -> bool:
 
 
 def _ok_worker() -> bool:
-    # worker_forward uses Mongo + Telethon sessions
+    # worker uses Mongo + Telethon sessions
     return _has_mongo_env()
 
 
 def _ok_enforcer() -> bool:
-    # profile_enforcer uses Mongo + Pyrogram
+    # enforcer uses Mongo + Pyrogram sessions
     return _has_mongo_env()
 
 
@@ -117,17 +114,13 @@ async def _run_login_bot() -> None:
 
 
 async def _run_worker() -> None:
-    """
-    Telethon forwarder worker entrypoint.
-
-    Old version used worker_forward.main_loop(), now we call main()
-    which internally runs the loader + per-user clients.
-    """
+    # Telethon-based forwarder
     import worker_forward
     await worker_forward.main()
 
 
 async def _run_enforcer() -> None:
+    # Pyrogram-based profile enforcer (file: profile_enforcer.py)
     import profile_enforcer
     await profile_enforcer.main()
 
@@ -170,37 +163,24 @@ async def run_service_loop(
             raise
         except Exception as e:
             d = backoff_seq[min(idx, len(backoff_seq) - 1)]
-            log.exception(
-                "[%s] crashed: %s; restarting in %ss",
-                padded_name,
-                e,
-                d,
-            )
+            log.exception("[%s] crashed: %s; restarting in %ss", padded_name, e, d)
             await asyncio.sleep(d)
             idx = min(idx + 1, len(backoff_seq) - 1)
 
 
 # ---------- Main ----------
 async def main() -> None:
-    # One instance per bot token! If you run multiple copies,
-    # Telegram will throw a conflict error.
+    # IMPORTANT:
+    #   Run ONLY ONE instance of run_all.py.
+    #   If you start multiple, Telegram will send "Conflict: terminated by other getUpdates".
     tasks = [
-        asyncio.create_task(
-            run_service_loop("login-bot", _ok_login_bot, _run_login_bot)
-        ),
-        asyncio.create_task(
-            run_service_loop("main-bot", _ok_main_bot, _run_main_bot)
-        ),
-        asyncio.create_task(
-            run_service_loop("worker", _ok_worker, _run_worker)
-        ),
-        asyncio.create_task(
-            run_service_loop("enforcer", _ok_enforcer, _run_enforcer)
-        ),
+        asyncio.create_task(run_service_loop("login-bot", _ok_login_bot, _run_login_bot)),
+        asyncio.create_task(run_service_loop("main-bot",  _ok_main_bot,  _run_main_bot)),
+        asyncio.create_task(run_service_loop("worker",    _ok_worker,    _run_worker)),
+        asyncio.create_task(run_service_loop("enforcer",  _ok_enforcer,  _run_enforcer)),
         asyncio.create_task(heartbeat()),
     ]
 
-    # graceful shutdown
     stop_ev: asyncio.Event = asyncio.Event()
 
     def _stop(*_: object) -> None:
@@ -212,7 +192,6 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, _stop)
         except NotImplementedError:
-            # Windows / limited event loop fallback
             signal.signal(sig, lambda *_: _stop())
 
     await stop_ev.wait()
@@ -226,5 +205,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # extra safety for Ctrl+C in some environments
         pass
