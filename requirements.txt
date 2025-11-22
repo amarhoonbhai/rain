@@ -1,11 +1,6 @@
 aiogram==3.22.0
-
-telethon==1.36.0
-
 pyrogram==2.0.106
 tgcrypto==1.2.5
-
+telethon==1.36.0
 pymongo==4.8.0
-dnspython==2.7.0
-
 python-dotenv==1.0.1
