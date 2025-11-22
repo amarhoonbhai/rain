@@ -1,4 +1,4 @@
-# core/db.py — Mongo-backed DB facade (compat API)
+# core/db.py — Mongo-backed DB facade (clean + no-premium version)
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -10,7 +10,9 @@ def init_db():
     ensure_indexes()
 
 
-# --- tiny SQL-ish shim for main_bot broadcast ---
+# ====================================
+# Fake SQL shim (used in broadcast)
+# ====================================
 class _FakeCursor:
     def __init__(self, rows):
         self._rows = rows
@@ -35,7 +37,9 @@ def get_conn():
     return _FakeConn()
 
 
-# ---------- helpers ----------
+# ====================================
+# Helpers
+# ====================================
 def _now() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
@@ -47,7 +51,9 @@ def _as_int(v, default=None):
         return default
 
 
-# ---------- settings KV ----------
+# ====================================
+# SETTINGS (Key/Value Store)
+# ====================================
 def set_setting(key: str, val: Any):
     db().settings.update_one(
         {"key": str(key)},
@@ -61,13 +67,14 @@ def get_setting(key: str, default: Any = None) -> Any:
     return default if not doc else doc.get("val", default)
 
 
-# ---------- users ----------
+# ====================================
+# USERS
+# ====================================
 def ensure_user(user_id: int, username: Optional[str] = None):
-    uid = int(user_id)
     db().users.update_one(
-        {"user_id": uid},
+        {"user_id": int(user_id)},
         {
-            "$setOnInsert": {"user_id": uid, "created_at": _now()},
+            "$setOnInsert": {"created_at": _now(), "user_id": int(user_id)},
             "$set": {"username": username},
         },
         upsert=True,
@@ -78,18 +85,13 @@ def users_count() -> int:
     return db().users.count_documents({})
 
 
-# ---------- sessions ----------
+# ====================================
+# SESSIONS (Login bot / Worker)
+# ====================================
 def sessions_list(user_id: int) -> List[Dict[str, Any]]:
     return list(
-        db()
-        .sessions.find({"user_id": int(user_id)}, {"_id": 0})
-        .sort("slot", 1)
+        db().sessions.find({"user_id": int(user_id)}, {"_id": 0}).sort("slot", 1)
     )
-
-
-def sessions_strings(user_id: int) -> List[Dict[str, Any]]:
-    # kept for backwards compat
-    return sessions_list(user_id)
 
 
 def sessions_count_user(user_id: int) -> int:
@@ -97,13 +99,12 @@ def sessions_count_user(user_id: int) -> int:
 
 
 def sessions_delete(user_id: int, slot: int) -> int:
-    res = db().sessions.delete_one(
-        {"user_id": int(user_id), "slot": int(slot)}
-    )
+    res = db().sessions.delete_one({"user_id": int(user_id), "slot": int(slot)})
     return int(res.deleted_count or 0)
 
 
 def _session_slots_cap(user_id: int) -> int:
+    """Simple fixed 3 slots per user (for Login Bot)"""
     try:
         return max(1, int(os.getenv("SESSION_SLOTS_CAP", "3")))
     except Exception:
@@ -112,15 +113,15 @@ def _session_slots_cap(user_id: int) -> int:
 
 def first_free_slot(user_id: int, cap: Optional[int] = None) -> Optional[int]:
     cap = cap or _session_slots_cap(user_id)
-    used = {
-        r["slot"]
-        for r in db()
-        .sessions.find({"user_id": int(user_id)}, {"slot": 1})
-    }
+    used = {r["slot"] for r in db().sessions.find(
+        {"user_id": int(user_id)}, {"slot": 1}
+    )}
+
     for s in range(1, cap + 1):
         if s not in used:
             return s
-    # fallback: reuse oldest slot
+
+    # no free slot → reuse oldest
     doc = db().sessions.find_one(
         {"user_id": int(user_id)}, sort=[("updated_at", 1)]
     )
@@ -130,13 +131,14 @@ def first_free_slot(user_id: int, cap: Optional[int] = None) -> Optional[int]:
 def sessions_upsert_slot(
     user_id: int, slot: int, api_id: int, api_hash: str, session_string: str
 ):
+    """Store login credentials"""
     db().sessions.update_one(
         {"user_id": int(user_id), "slot": int(slot)},
         {
             "$set": {
                 "api_id": int(api_id),
-                "api_hash": str(api_hash),
-                "session_string": str(session_string),
+                "api_hash": api_hash,
+                "session_string": session_string,
                 "updated_at": _now(),
             }
         },
@@ -144,116 +146,61 @@ def sessions_upsert_slot(
     )
 
 
-# legacy aliases
-upsert_session_slot = sessions_upsert_slot
-sessions_upsert = sessions_upsert_slot
-sessions_upsert_slot = sessions_upsert_slot
-count_user_sessions = sessions_count_user
-delete_session_slot = sessions_delete
+# Login Bot compatibility
+def store_api_credentials(user_id: int, slot: int, api_id: int, api_hash: str, ss: str):
+    sessions_upsert_slot(user_id, slot, api_id, api_hash, ss)
 
 
-def users_with_sessions() -> List[int]:
-    return [
-        r["_id"]
-        for r in db()
-        .sessions.aggregate([{"$group": {"_id": "$user_id"}}])
-    ]
+def delete_api_credentials(user_id: int, slot: int):
+    return sessions_delete(user_id, slot)
 
 
-def sessions_count() -> int:
-    return len(users_with_sessions())
-
-
-# ---------- groups / caps ----------
-def is_premium(user_id: int) -> bool:
-    v = get_setting(f"premium:{int(user_id)}", 0)
-    try:
-        return bool(int(v))
-    except Exception:
-        return bool(v)
-
-
-def set_premium(user_id: int, enabled: bool):
-    set_setting(f"premium:{int(user_id)}", 1 if enabled else 0)
-
-
-def list_premium_users() -> List[int]:
-    out: List[int] = []
-    for r in db().settings.find(
-        {
-            "key": {"$regex": r"^premium:\d+$"},
-            "val": {"$in": [1, "1", True]},
-        }
-    ):
-        try:
-            out.append(int(r["key"].split(":")[1]))
-        except Exception:
-            pass
-    return out
-
-
-def is_gc_unlocked(user_id: int) -> bool:
-    v = get_setting(f"gc_unlock:{int(user_id)}", 0)
-    try:
-        return bool(int(v))
-    except Exception:
-        return bool(v)
-
-
-def set_gc_unlock(user_id: int, enabled: bool):
-    set_setting(f"gc_unlock:{int(user_id)}", 1 if enabled else 0)
-
-
+# ====================================
+# GROUPS
+# ====================================
 def groups_cap(user_id: Optional[int] = None) -> int:
     """
-    Group cap logic:
-      - if user_id is None -> 5 (generic default)
-      - if premium flag true -> 50
-      - else if explicit groups_cap:<uid> setting exists -> use that
-      - else if gc_unlock flag true -> 20
-      - else -> 5
+    NEW LOGIC:
+    - default = 5 groups
+    - if manually unlocked → 20
     """
     if user_id is None:
         return 5
+
     uid = int(user_id)
 
-    if is_premium(uid):
-        return 50
-
+    # manual unlock
     v = get_setting(f"groups_cap:{uid}", None)
     if v is not None:
-        vi = _as_int(v, None)
-        if vi is not None:
-            return vi
+        return _as_int(v, 5)
 
-    # fallback: legacy unlock flag
-    if is_gc_unlocked(uid):
+    # legacy unlock flag
+    if get_setting(f"gc_unlock:{uid}", 0) not in (0, "0", None, False):
         return 20
 
     return 5
 
 
-def _groups_doc(user_id: int):
+def list_groups(user_id: int) -> List[str]:
     doc = db().groups.find_one({"user_id": int(user_id)})
     if not doc:
-        doc = {"user_id": int(user_id), "targets": [], "updated_at": _now()}
-        db().groups.insert_one(doc)
-    return doc
-
-
-def list_groups(user_id: int) -> List[str]:
-    return list(_groups_doc(int(user_id)).get("targets", []))
+        return []
+    return list(doc.get("targets", []))
 
 
 def add_group(user_id: int, target: str) -> int:
-    target = (target or "").strip()
     if not target:
         return 0
+
+    target = target.strip()
     items = list_groups(user_id)
+
     if target in items:
         return 0
+
     if len(items) >= groups_cap(user_id):
         return 0
+
     items.append(target)
     db().groups.update_one(
         {"user_id": int(user_id)},
@@ -271,7 +218,9 @@ def clear_groups(user_id: int):
     )
 
 
-# ---------- intervals / schedule ----------
+# ====================================
+# INTERVALS / SCHEDULING
+# ====================================
 def set_interval(user_id: int, minutes: int):
     set_setting(f"interval:{int(user_id)}", int(minutes))
 
@@ -279,34 +228,23 @@ def set_interval(user_id: int, minutes: int):
 def get_interval(user_id: int) -> int:
     v = get_setting(f"interval:{int(user_id)}", None)
     iv = _as_int(v, None)
-    return iv if iv is not None else int(
-        os.getenv("DEFAULT_INTERVAL_MIN", "30")
-    )
+    return iv if iv is not None else int(os.getenv("DEFAULT_INTERVAL_MIN", "30"))
 
 
 def get_last_sent_at(user_id: int) -> Optional[int]:
     v = get_setting(f"last_sent_at:{int(user_id)}", None)
-    return _as_int(v, None) if v is not None else None
+    return _as_int(v, None)
 
 
-def mark_sent_now(user_id: int):
-    set_setting(f"last_sent_at:{int(user_id)}", _now())
-
-
-# alias used by worker_forward
 def set_last_sent_at(user_id: int, ts: int | None = None):
-    """
-    Backwards-compatible helper:
-      - if ts is None → mark 'now'
-      - else → set explicit timestamp.
-    """
     if ts is None:
-        mark_sent_now(user_id)
-    else:
-        set_setting(f"last_sent_at:{int(user_id)}", int(ts))
+        ts = _now()
+    set_setting(f"last_sent_at:{int(user_id)}", ts)
 
 
-# ---------- stats ----------
+# ====================================
+# STATS
+# ====================================
 def inc_sent_ok(user_id: int, delta: int = 1):
     db().stats.update_one(
         {"user_id": int(user_id)},
@@ -327,50 +265,26 @@ def get_total_sent_ok() -> int:
 
 def top_users(limit: int = 10) -> List[Dict[str, Any]]:
     rows = list(
-        db()
-        .stats.find({}, {"_id": 0})
+        db().stats.find({}, {"_id": 0})
         .sort("sent_ok", -1)
         .limit(int(max(1, min(100, limit))))
     )
     for r in rows:
-        r.setdefault("user_id", 0)
         r["sent_ok"] = _as_int(r.get("sent_ok", 0), 0)
     return rows
 
 
-def last_sent_at_for(user_id: int):
-    # legacy alias
-    return get_last_sent_at(user_id)
-
-
-# ---------- ads (compat) ----------
-def set_ad(user_id: int, text: str, parse_mode: Optional[str]):
-    db().settings.update_one(
-        {"key": f"ad:{int(user_id)}"},
-        {
-            "$set": {
-                "key": f"ad:{int(user_id)}",
-                "text": text,
-                "mode": parse_mode,
-            }
-        },
-        upsert=True,
-    )
-
-
-def get_ad(user_id: int):
-    doc = db().settings.find_one({"key": f"ad:{int(user_id)}"})
-    return (doc.get("text"), doc.get("mode")) if doc else (None, None)
-
-
-# ---------- gate + night ----------
-def get_gate_channels_effective() -> tuple[Optional[str], Optional[str]]:
+# ====================================
+# GATE CHANNELS
+# ====================================
+def get_gate_channels_effective() -> tuple[str | None, str | None]:
     ch1 = get_setting("gate:ch1", None)
     ch2 = get_setting("gate:ch2", None)
+
     if ch1 or ch2:
         return ch1, ch2
 
-    env = os.getenv("REQUIRED_CHANNELS", "").strip()
+    env = os.getenv("REQUIRED_CHANNELS", "")
     if env:
         parts = [p.strip() for p in env.split(",") if p.strip()]
         if len(parts) >= 2:
@@ -378,34 +292,4 @@ def get_gate_channels_effective() -> tuple[Optional[str], Optional[str]]:
         if len(parts) == 1:
             return parts[0], None
 
-    # default pair
     return "@PhiloBots", "@TheTrafficZone"
-
-
-def night_enabled() -> bool:
-    v = get_setting("night:enabled", 0)
-    try:
-        return bool(int(v))
-    except Exception:
-        return bool(v)
-
-
-def set_night_enabled(enabled: bool):
-    set_setting("night:enabled", 1 if enabled else 0)
-
-
-# ---------- premium name-lock (used by enforcer) ----------
-def set_name_lock(user_id: int, enabled: bool, name: Optional[str] = None):
-    set_setting(f"premium:lock:enabled:{int(user_id)}", 1 if enabled else 0)
-    if name is not None:
-        set_setting(f"premium:lock:name:{int(user_id)}", name)
-
-
-def get_setting_name_lock(user_id: int):
-    en = get_setting(f"premium:lock:enabled:{int(user_id)}", 0)
-    try:
-        en = bool(int(en))
-    except Exception:
-        en = bool(en)
-    name = get_setting(f"premium:lock:name:{int(user_id)}", None)
-    return en, name
