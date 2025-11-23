@@ -1,96 +1,86 @@
 #!/usr/bin/env python3
+# run_all.py — Spinify Ads Supervisor (B-2 Version)
+# Automatically runs:
+#   ✔ login_bot.py
+#   ✔ main_bot.py
+#   ✔ worker_forward.py
+#   ✔ profile_enforcer.py
+#
+# Restarts crashed services automatically.
+
 import asyncio
 import logging
+import os
 import importlib
-import traceback
-from datetime import datetime
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [runner] %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format='[%(asctime)s] [%(name)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
+
 log = logging.getLogger("runner")
 
-
-# ---------------------------------------------------------
-# Utility loader
-# ---------------------------------------------------------
-def load_module(name):
+# ============================================================
+# Helper: Dynamic Import
+# ============================================================
+def load(module_name: str):
+    """Safe import & reload to reflect live changes."""
     try:
-        return importlib.import_module(name)
-    except Exception:
-        log.error(f"Failed importing {name}:\n{traceback.format_exc()}")
-        return None
+        if module_name in globals():
+            return importlib.reload(globals()[module_name])
+        mod = importlib.import_module(module_name)
+        globals()[module_name] = mod
+        return mod
+    except Exception as e:
+        log.error(f"Failed loading module {module_name}: {e}")
+        raise
 
 
-# ---------------------------------------------------------
-# Run a service loop (auto-restart if crashed)
-# ---------------------------------------------------------
-async def run_service_loop(name, start_fn):
-    """Keeps service alive forever."""
+# ============================================================
+# Service Launcher
+# ============================================================
+async def run_service(name: str, module_name: str, entry: str):
+    """Runs services in endless loop and restarts if crash."""
     while True:
         try:
-            log.info(f"[{name:<10}] starting…")
+            mod = load(module_name)
+            start_fn = getattr(mod, entry)
+
+            log.info(f"[{name}] starting…")
             await start_fn()
-        except Exception:
-            log.error(
-                f"[{name:<10}] crashed:\n{traceback.format_exc()}\n"
-                "Restarting in 12s…"
-            )
-        await asyncio.sleep(12)
+
+        except Exception as e:
+            log.error(f"[{name}] crashed: {e}; restarting in 12s")
+            await asyncio.sleep(12)
 
 
-# ---------------------------------------------------------
-# Worker launcher (Telethon forward engine)
-# ---------------------------------------------------------
-async def _run_worker():
-    worker_mod = load_module("worker_forward")
-    if not worker_mod or not hasattr(worker_mod, "start"):
-        raise RuntimeError("worker_forward.start() missing")
-
-    await worker_mod.start()
-
-
-# ---------------------------------------------------------
-# Enforcer launcher (Profile + Name/Bio locking)
-# ---------------------------------------------------------
-async def _run_enforcer():
-    enf_mod = load_module("profile_enforcer")
-    if not enf_mod or not hasattr(enf_mod, "start_enforcer"):
-        raise RuntimeError("profile_enforcer.start_enforcer() missing")
-
-    await enf_mod.start_enforcer()
-
-
-# ---------------------------------------------------------
-# Login bot launcher
-# ---------------------------------------------------------
-async def _run_login_bot():
-    lb = load_module("login_bot")
-    if not lb or not hasattr(lb, "main"):
-        raise RuntimeError("login_bot.main() missing")
-    await lb.main()
-
-
-# ---------------------------------------------------------
-# Panel bot launcher (main dashboard)
-# ---------------------------------------------------------
-async def _run_main_bot():
-    mb = load_module("main_bot")
-    if not mb or not hasattr(mb, "main"):
-        raise RuntimeError("main_bot.main() missing")
-    await mb.main()
-
-
-# ---------------------------------------------------------
-# Main entry — run all 4 services in parallel
-# ---------------------------------------------------------
+# ============================================================
+# Entrypoint
+# ============================================================
 async def main():
+    log.info("Spinify Supervisor starting…")
+
     tasks = [
-        asyncio.create_task(run_service_loop("worker", _run_worker)),
-        asyncio.create_task(run_service_loop("enforcer", _run_enforcer)),
-        asyncio.create_task(run_service_loop("login_bot", _run_login_bot)),
-        asyncio.create_task(run_service_loop("main_bot", _run_main_bot)),
+        # login bot
+        asyncio.create_task(run_service(
+            "login-bot", "login_bot", "main"
+        )),
+
+        # main panel
+        asyncio.create_task(run_service(
+            "main-bot", "main_bot", "main"
+        )),
+
+        # worker — forwards ads
+        asyncio.create_task(run_service(
+            "worker", "worker_forward", "start"
+        )),
+
+        # enforcer — fixes name & bio
+        asyncio.create_task(run_service(
+            "enforcer", "profile_enforcer", "start"
+        )),
     ]
 
     await asyncio.gather(*tasks)
@@ -100,4 +90,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Exiting…")
+        log.info("Shutting down.")
