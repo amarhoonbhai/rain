@@ -1,88 +1,123 @@
 # profile_enforcer.py
-# Spinify Ads — Profile Enforcer (B-2 Stable Version)
-# Automatically fixes:
-#   ✔ BIO
-#   ✔ NAME SUFFIX
-#   ✔ Username stays original (never touches)
-#
-# Runs every 20 minutes from run_all.py
+# Spinify Ads — Profile/Bio Enforcer (Stable B2 Version)
+# Runs in background via run_all.py
+# Keeps name suffix + bio always correct.
 
 import asyncio
 import logging
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
+from datetime import datetime, timezone
 
 from core.db import (
     init_db,
     sessions_list,
-    ensure_user,
-    get_conn
+    get_conn,
+    get_setting,
 )
 
 log = logging.getLogger("enforcer")
 
-# Required branding
-BIO = "#1 Free Ads Bot — Managed By @PhiloBots"
-NAME_SUFFIX = " Hosted By — @SpinifyAdsBot"
+# Defaults (Login bot also sets these)
+DEFAULT_BIO = "#1 Free Ads Bot — Managed By @PhiloBots"
+DEFAULT_SUFFIX = " Hosted By — @SpinifyAdsBot"
+
+
+# ------------------------------
+# Helpers
+# ------------------------------
+def now_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
 
 
 async def enforce_for_user(uid: int, sess: dict):
-    """Fix BIO and Name Suffix for a single logged account"""
-
-    api_id = sess["api_id"]
+    """Connect the user's session → fix bio + fix name suffix."""
+    api_id = int(sess["api_id"])
     api_hash = sess["api_hash"]
-    s = sess["session_string"]
+    string_sess = sess["session_string"]
 
-    client = TelegramClient(StringSession(s), api_id, api_hash)
+    client = TelegramClient(
+        StringSession(string_sess),
+        api_id=api_id,
+        api_hash=api_hash,
+        system_version="Android"
+    )
 
     try:
         await client.start()
+    except Exception as e:
+        log.error(f"[ENF] Cannot start user {uid}: {e}")
+        return
+
+    try:
         me = await client.get_me()
 
-        base = (me.first_name or "User").split(" Hosted By — ")[0]
-        desired_name = base + NAME_SUFFIX
-
-        # Enforce name
+        # -------------------
+        # enforce BIO
+        # -------------------
         try:
-            if (me.first_name or "") != desired_name:
-                await client.update_profile(first_name=desired_name)
-                log.info(f"[{uid}] name enforced → {desired_name}")
-        except Exception as e:
-            log.warning(f"[{uid}] name update failed: {e}")
+            current_bio = me.bot_info_description or ""
+        except:
+            current_bio = ""
 
-        # Enforce bio
+        bio = get_setting(f"bio:{uid}", DEFAULT_BIO)
+
+        if current_bio != bio:
+            try:
+                await client.update_profile(bio=bio)
+                log.info(f"[ENF] Bio updated for {uid}")
+            except Exception:
+                pass
+
+        # -------------------
+        # enforce NAME SUFFIX
+        # -------------------
         try:
-            await client.update_profile(bio=BIO)
-        except Exception as e:
-            log.warning(f"[{uid}] bio update failed: {e}")
+            fname = me.first_name or "User"
+        except:
+            fname = "User"
+
+        suffix = get_setting(f"name_suffix:{uid}", DEFAULT_SUFFIX)
+        base = fname.split(" Hosted By — ")[0].strip()
+        desired = base + suffix
+
+        if fname != desired:
+            try:
+                await client.update_profile(first_name=desired)
+                log.info(f"[ENF] Name updated for {uid}")
+            except Exception:
+                pass
 
     except Exception as e:
-        log.error(f"[{uid}] enforcer failed: {e}")
+        log.error(f"[ENF] Error enforcing for {uid}: {e}")
 
     finally:
         await client.disconnect()
 
 
+# ------------------------------
+# Infinite loop
+# ------------------------------
 async def start():
-    """Called by run_all.py — runs infinite loop"""
-
+    """Entry for run_all.py"""
     init_db()
-    log.info("Enforcer started.")
+    log.info("Enforcer: started")
 
     while True:
         try:
             rows = get_conn().execute("SELECT user_id FROM users").fetchall()
+            if not rows:
+                await asyncio.sleep(10)
+                continue
 
             for r in rows:
                 uid = r["user_id"]
-                sessions = sessions_list(uid)
 
-                for sess in sessions:
+                for sess in sessions_list(uid):
                     await enforce_for_user(uid, sess)
-
-            log.info("Enforcer cycle completed.")
+                    await asyncio.sleep(2)  # small delay
 
         except Exception as e:
-            log.error(f"Enforcer fatal error: {e}")
+            log.error(f"[ENF] Loop crash: {e}")
 
-        await asyncio.sleep(1200)  # 20 minutes
+        await asyncio.sleep(30)  # run every 30s
