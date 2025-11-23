@@ -1,6 +1,5 @@
 # worker_forward.py
-# Spinify Ads — Telethon Forwarder (Stable B2 Version)
-# Fully compatible with: db.py, login_bot, main_bot, run_all.py
+# Spinify Ads — Telethon Forwarder (Stable B2 — FIXED VERSION)
 
 import asyncio
 import logging
@@ -29,9 +28,9 @@ from core.db import (
 log = logging.getLogger("worker")
 
 
-# -------------------------
+# ---------------------------------------------------------
 # Helpers
-# -------------------------
+# ---------------------------------------------------------
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
@@ -48,9 +47,9 @@ def set_saved_ad(uid: int, text: str):
     set_setting(f"ad_text:{uid}", text)
 
 
-# -------------------------
-# Self Commands
-# -------------------------
+# ---------------------------------------------------------
+# Commands
+# ---------------------------------------------------------
 async def cmd_help(ev, uid):
     await ev.reply(
         "✹ <b>Spinify Commands</b>\n\n"
@@ -106,10 +105,7 @@ async def cmd_gc(ev, uid):
     g = list_groups(uid)
     if not g:
         return await ev.reply("No groups added.")
-
-    txt = "🎯 <b>Your Groups</b>\n" + "\n".join(
-        f"{i+1}. {x}" for i, x in enumerate(g)
-    )
+    txt = "🎯 <b>Your Groups</b>\n" + "\n".join(f"{i+1}. {x}" for i, x in enumerate(g))
     await ev.reply(txt, parse_mode="html")
 
 
@@ -121,7 +117,6 @@ async def cmd_addgc(ev, uid, raw):
 
     added = sum(add_group(uid, g) for g in found)
     skipped = len(found) - added
-
     await ev.reply(f"Added: {added} | Skipped: {skipped}")
 
 
@@ -136,13 +131,11 @@ async def cmd_adreset(ev, uid, client):
         if m.raw_text and not is_cmd(m.raw_text):
             set_saved_ad(uid, m.raw_text)
             return await ev.reply("Ad updated from Saved Messages.")
-
     await ev.reply("No valid ad found.")
 
 
 async def handle_command(ev, uid, client):
     t = (ev.raw_text or "").lower()
-
     if t.startswith(".help"): return await cmd_help(ev, uid)
     if t.startswith(".status"): return await cmd_status(ev, uid)
     if t.startswith(".time"): return await cmd_time(ev, uid, ev.raw_text)
@@ -150,13 +143,12 @@ async def handle_command(ev, uid, client):
     if t.startswith(".addgc"): return await cmd_addgc(ev, uid, ev.raw_text)
     if t.startswith(".cleargc"): return await cmd_cleargc(ev, uid)
     if t.startswith(".adreset"): return await cmd_adreset(ev, uid, client)
-
     await ev.reply("Unknown command. Use .help")
 
 
-# -------------------------
+# ---------------------------------------------------------
 # Forward Loop
-# -------------------------
+# ---------------------------------------------------------
 async def forward_loop(client: TelegramClient, uid: int):
     while True:
         interval = get_interval(uid)
@@ -182,8 +174,10 @@ async def forward_loop(client: TelegramClient, uid: int):
                 await client.send_message(g, ad)
                 inc_sent_ok(uid)
                 log.info(f"[{uid}] → Sent to {g}")
+
             except errors.FloodWaitError as e:
                 await asyncio.sleep(e.seconds)
+
             except Exception as e:
                 log.error(f"Error sending to {g}: {e}")
 
@@ -192,9 +186,9 @@ async def forward_loop(client: TelegramClient, uid: int):
         set_last_sent_at(uid, now_ts())
 
 
-# -------------------------
-# Per-session Telethon Client
-# -------------------------
+# ---------------------------------------------------------
+# Per-session Worker
+# ---------------------------------------------------------
 async def client_worker(uid: int, sess: Dict[str, Any]):
     client = TelegramClient(
         StringSession(sess["session_string"]),
@@ -222,10 +216,9 @@ async def client_worker(uid: int, sess: Dict[str, Any]):
         await client.disconnect()
         log.info(f"Stopped session: uid={uid}, slot={sess['slot']}")
 
-
-# -------------------------
-# Entry for run_all.py
-# -------------------------
+# ---------------------------------------------------------
+# ENTRY FOR run_all.py
+# ---------------------------------------------------------
 async def start():
     init_db()
 
@@ -236,7 +229,6 @@ async def start():
         return
 
     tasks = []
-
     for r in rows:
         uid = r["user_id"]
         for sess in sessions_list(uid):
